@@ -66,6 +66,14 @@ cargo build --release
 ./target/release/drama speak --model models/drama-3-q4 --interactive --play
 ```
 
+Text is generated one sentence at a time, like the reference server's streaming endpoint.
+Without a voice reference, Drama 3 often never ends after a sentence-final full stop when more
+text follows. It fills the rest with silence: about a quarter of runs, measured on both the
+original FP8 weights and this int4 build. Speaking each sentence on its own avoids that. A
+speaker with no `--ref-wav` gets their own first sentence as the reference for the rest, so the
+voice stays the same, and a sentence that still stalls is cut at a length cap and said again.
+`--no-split` turns all of this off.
+
 Sampling defaults follow the reference server: `--temperature 1.0 --top-k 30 --top-p 0.9`,
 plus repetition-aware sampling over the last 16 frames. Multi-speaker text uses
 `<|speaker:N|>` tags (N in 0..15); inline tags like `[laughs]` are passed through.

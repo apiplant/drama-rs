@@ -10,6 +10,7 @@ const GENERATION_START: &str = "<|im_start|>assistant\n<|voice|>";
 const STRUCTURAL: [&str; 6] = ["<|im_start|>", "<|im_end|>", "<|voice|>", "<|text|>", "<|interleave|>", "<|semantic:"];
 
 /// A voice reference: its transcript and codec codes [num_codebooks][frames].
+#[derive(Clone)]
 pub struct Reference {
     pub transcript: String,
     pub codes: Vec<Vec<i32>>,
@@ -106,4 +107,128 @@ pub fn build_prompt_rows(text: &str, references: &[Reference], tok: &Tokenizer, 
     push_text(GENERATION_START, &mut rows)?;
     debug_assert_eq!(rows.len() % width, 0);
     Ok(rows)
+}
+
+/// The leading `<|speaker:N|>` of `text` (after white space), if any.
+pub fn leading_speaker(text: &str) -> Option<u32> {
+    let s = text.trim_start_matches(is_ws);
+    let len = speaker_tag_len(s)?;
+    s["<|speaker:".len()..len - 2].parse().ok()
+}
+
+/// Every speaker tag in `text`, in order.
+fn speakers(text: &str) -> Vec<u32> {
+    let mut out = Vec::new();
+    let mut at = 0;
+    while let Some(i) = text[at..].find("<|speaker:") {
+        let s = &text[at + i..];
+        match speaker_tag_len(s) {
+            Some(len) => {
+                if let Ok(n) = s["<|speaker:".len()..len - 2].parse() {
+                    out.push(n);
+                }
+                at += i + len;
+            }
+            None => at += i + 1,
+        }
+    }
+    out
+}
+
+/// The speaker of every line of `text` when it is all one speaker (untagged text is speaker 0).
+pub fn sole_speaker(text: &str) -> Option<u32> {
+    let mut sp = speakers(text);
+    if leading_speaker(text).is_none() {
+        sp.insert(0, 0);
+    }
+    sp.dedup();
+    if sp.len() == 1 { Some(sp[0]) } else { None }
+}
+
+/// Split text into sentences at . ! ? (and their CJK forms), the way the reference server's
+/// streaming endpoint does, so each is generated on its own. Untagged sentences get the speaker
+/// tag in force where they start, so splitting never changes who speaks.
+pub fn split_sentences(text: &str) -> Vec<String> {
+    const END: &[char] = &['.', '!', '?', '。', '！', '？'];
+    const CJK_END: &[char] = &['。', '！', '？'];
+    const CLOSE: &[char] = &['"', '\'', ')', ']', '”', '’', '»'];
+    let mut raw: Vec<&str> = Vec::new();
+    let chars: Vec<(usize, char)> = text.char_indices().collect();
+    let (mut start, mut i) = (0, 0);
+    while i < chars.len() {
+        let c = chars[i].1;
+        if END.contains(&c) {
+            // Take the whole run of terminators ("?!", "...") and any closing quotes.
+            let mut j = i + 1;
+            while j < chars.len() && (END.contains(&chars[j].1) || CLOSE.contains(&chars[j].1)) {
+                j += 1;
+            }
+            let end = chars.get(j).map_or(text.len(), |&(b, _)| b);
+            // "..." is a pause inside the sentence, not its end.
+            let run = &chars[i..j];
+            let ellipsis = run.iter().filter(|&&(_, c)| c == '.').count() >= 2 && run.iter().all(|&(_, c)| c == '.' || CLOSE.contains(&c));
+            let at_break = !ellipsis && (j == chars.len() || is_ws(chars[j].1) || chars[j].1 == '<' || CJK_END.contains(&chars[j - 1].1));
+            if at_break {
+                raw.push(&text[start..end]);
+                start = end;
+            }
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    raw.push(&text[start..]);
+
+    let mut out: Vec<String> = Vec::new();
+    let mut speaker: Option<u32> = None;
+    for seg in raw {
+        let seg = seg.trim_matches(is_ws);
+        if seg.is_empty() {
+            continue;
+        }
+        // Punctuation-only pieces ("...") belong to the sentence before them.
+        if !seg.chars().any(|c| c.is_alphanumeric()) {
+            if let Some(last) = out.last_mut() {
+                last.push_str(seg);
+                continue;
+            }
+        }
+        let tagged = match (leading_speaker(seg), speaker) {
+            (None, Some(n)) => format!("<|speaker:{n}|> {seg}"),
+            _ => seg.to_string(),
+        };
+        if let Some(&n) = speakers(&tagged).last() {
+            speaker = Some(n);
+        }
+        out.push(tagged);
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn splits_sentences_and_carries_speakers() {
+        assert_eq!(split_sentences("Hello there. How are you?"), vec!["Hello there.", "How are you?"]);
+        assert_eq!(split_sentences("Wait... what?! No."), vec!["Wait... what?!", "No."]);
+        assert_eq!(split_sentences("It costs 3.50 dollars."), vec!["It costs 3.50 dollars."]);
+        assert_eq!(split_sentences("He said \"stop.\" Then left."), vec!["He said \"stop.\"", "Then left."]);
+        assert_eq!(
+            split_sentences("<|speaker:0|> Where were you? <|speaker:1|> [nervous] Out. Just... out. <|speaker:0|> Out where?"),
+            vec!["<|speaker:0|> Where were you?", "<|speaker:1|> [nervous] Out.", "<|speaker:1|> Just... out.", "<|speaker:0|> Out where?"]
+        );
+        assert_eq!(split_sentences("你好。我很好！"), vec!["你好。", "我很好！"]);
+        assert_eq!(split_sentences("No ending"), vec!["No ending"]);
+        assert_eq!(split_sentences("And then..."), vec!["And then..."]);
+    }
+
+    #[test]
+    fn speakers_of_text() {
+        assert_eq!(sole_speaker("Hi."), Some(0));
+        assert_eq!(sole_speaker("<|speaker:2|> Hi."), Some(2));
+        assert_eq!(sole_speaker("<|speaker:2|> Hi. <|speaker:2|> Yo."), Some(2));
+        assert_eq!(sole_speaker("Hi <|speaker:1|> yo."), None);
+    }
 }

@@ -94,6 +94,9 @@ enum Cmd {
         first_chunk: usize,
         #[arg(long, default_value_t = 16)]
         stream_chunk: usize,
+        /// Generate the whole text at once instead of sentence by sentence
+        #[arg(long)]
+        no_split: bool,
     },
     /// Run raw prompt rows and dump frames + logits per step (engine tests).
     Trace {
@@ -153,7 +156,7 @@ fn write_le<T: Copy>(w: &mut impl Write, v: &[T]) -> Result<()> {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::Speak { common, text, out, play, interactive, ref_wav, ref_text, codes_out, prompt_out, max_new, first_chunk, stream_chunk } => {
+        Cmd::Speak { common, text, out, play, interactive, ref_wav, ref_text, codes_out, prompt_out, max_new, first_chunk, stream_chunk, no_split } => {
             if ref_wav.len() != ref_text.len() {
                 anyhow::bail!("give one --ref-text per --ref-wav");
             }
@@ -176,7 +179,7 @@ fn main() -> Result<()> {
                 eprintln!("reference {}: {} frames in {:.0} ms", wav.display(), r.codes[0].len(), t1.elapsed().as_secs_f64() * 1e3);
                 refs.push(r);
             }
-            let opts = tts::SpeakOpts { params: common.params(), max_new, first_chunk, chunk: stream_chunk };
+            let opts = tts::SpeakOpts { params: common.params(), max_new, first_chunk, chunk: stream_chunk, split: !no_split };
             let mut player = if play { Some(tts::Player::new()?) } else { None };
             let lines: Box<dyn Iterator<Item = String>> = match text {
                 Some(t) if !interactive => Box::new(std::iter::once(t)),
@@ -193,7 +196,8 @@ fn main() -> Result<()> {
                 })?;
                 let audio_s = spoken.audio.len() as f64 / codec::SAMPLE_RATE as f64;
                 eprintln!(
-                    "{} prompt rows -> {} frames ({audio_s:.2}s of audio) in {:.2}s ({:.1}x real time), first audio after {:.0} ms",
+                    "{} sentence(s), {} prompt rows -> {} frames ({audio_s:.2}s of audio) in {:.2}s ({:.1}x real time), first audio after {:.0} ms",
+                    spoken.segments,
                     spoken.prompt_rows,
                     spoken.frames.len(),
                     spoken.elapsed.as_secs_f64(),
