@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>drama-rs — Fish Audio Drama 3 text-to-speech in Rust</title>
+    <meta name="description" content="Fish Audio Drama 3 text-to-speech on a single 24 GB GPU, in Rust and CUDA. A 35B MoE voice model in int4, voice cloning, multi-speaker dialogue and streaming playback at 8.9x real time on an RTX 4090. No PyTorch." />
+    <meta name="keywords" content="drama 3, fish audio, text to speech, TTS, voice cloning, CUDA, Rust, int4, MoE, local TTS" />
+    <meta name="robots" content="index, follow, max-image-preview:large" />
+    <link rel="canonical" href="https://drama-rs.apiplant.com/" />
+    <meta property="og:site_name" content="drama-rs" />
+    <meta property="og:title" content="drama-rs — Fish Audio Drama 3 text-to-speech in Rust" />
+    <meta property="og:description" content="Fish Audio Drama 3 text-to-speech on a single 24 GB GPU, in Rust and CUDA. A 35B MoE voice model in int4, voice cloning, multi-speaker dialogue and streaming playback at 8.9x real time on an RTX 4090. No PyTorch." />
+    <meta property="og:url" content="https://drama-rs.apiplant.com/" />
+    <meta property="og:type" content="website" />
+    <meta name="twitter:card" content="summary" />
+    <meta name="twitter:title" content="drama-rs — Fish Audio Drama 3 text-to-speech in Rust" />
+    <meta name="twitter:description" content="Fish Audio Drama 3 text-to-speech on a single 24 GB GPU, in Rust and CUDA. A 35B MoE voice model in int4, voice cloning, multi-speaker dialogue and streaming playback at 8.9x real time on an RTX 4090. No PyTorch." />
+    <meta name="theme-color" content="#171a21" media="(prefers-color-scheme: dark)" />
+    <meta name="theme-color" content="#f2f5fa" media="(prefers-color-scheme: light)" />
+    <script type="application/ld+json">
+      {
+        "@context": "https://schema.org",
+        "@type": "SoftwareApplication",
+        "name": "drama-rs",
+        "description": "Fish Audio Drama 3 text-to-speech on a single 24 GB GPU, in Rust and CUDA. A 35B MoE voice model in int4, voice cloning, multi-speaker dialogue and streaming playback at 8.9x real time on an RTX 4090. No PyTorch.",
+        "applicationCategory": "DeveloperApplication",
+        "operatingSystem": "Linux, macOS",
+        "url": "https://drama-rs.apiplant.com/",
+        "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" }
+      }
+    </script>
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%2327282f'/%3E%3Cpath d='M7 13v6M12 9v14M17 5v22M22 9v14M27 13v6' stroke='%23a78bfa' stroke-width='2' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E"
+    />
+    <script>
+      // Set the theme before first paint so the page never flashes the wrong one.
+      (function () {
+        try {
+          var stored = localStorage.getItem("drama-rs-theme");
+          var light =
+            stored === "light" ||
+            (!stored && window.matchMedia("(prefers-color-scheme: light)").matches);
+          if (light) document.documentElement.classList.add("light");
+          document.documentElement.style.colorScheme = light ? "light" : "dark";
+        } catch (_) {
+          /* private mode: dark is the default anyway */
+        }
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/index.tsx"></script>
+  </body>
+</html>

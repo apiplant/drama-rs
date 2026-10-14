@@ -2,15 +2,32 @@
 name = "drama-rs"
 version = "0.1.0"
 edition = "2021"
-description = "Fish Audio Drama 3 text-to-speech on a single 24 GB GPU"
+description = "Fish Audio Drama 3 text-to-speech on a single 24 GB GPU (Rust + CUDA)"
+license = "Apache-2.0"
+repository = "https://github.com/apiplant/drama-rs"
+homepage = "https://drama-rs.apiplant.com"
+readme = "README.md"
+keywords = ["text-to-speech", "tts", "cuda", "fish-audio", "voice-cloning"]
+categories = ["multimedia::audio", "science", "command-line-utilities"]
+# the crate is the engine, its CUDA kernels and the binary; weights are downloaded separately
+include = ["/src/", "/kernels/", "/build.rs", "/README.md", "/LICENSE"]
+
+[lib]
+name = "drama"
+
+[features]
+default = ["cli"]
+# the `drama` command-line binary (clap). Disable default features to use drama as a library
+cli = ["dep:clap"]
 
 [[bin]]
 name = "drama"
 path = "src/main.rs"
+required-features = ["cli"]
 
 [dependencies]
 anyhow = "1"
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive"], optional = true }
 half = "2"
 hound = "3.5"
 memmap2 = "0.9"
@@ -21,3 +38,9 @@ tokenizers = { version = "0.21", default-features = false, features = ["fancy-re
 
 [profile.release]
 debug = 1
+
+# release archives and packages: no debug info (`release` keeps it for profiling)
+[profile.dist]
+inherits = "release"
+debug = 0
+strip = true

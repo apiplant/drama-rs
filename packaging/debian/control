@@ -1,0 +1,17 @@
+Package: drama-rs
+Version: @VERSION@
+Section: sound
+Priority: optional
+Architecture: @ARCH@
+Depends: libcuda1, libcudart12, libcublas12
+Maintainer: apiplant <releases@apiplant.com>
+Installed-Size: @INSTALLED_SIZE@
+Homepage: https://github.com/apiplant/drama-rs
+Description: Fish Audio Drama 3 text-to-speech on a single 24 GB GPU (CUDA)
+ drama speaks text with Fish Audio Drama 3 (a 35B-total / 3B-active MoE
+ backbone plus the Fish DAC codec), with voice cloning from a reference
+ clip and streaming playback. Needs an NVIDIA GPU with 24 GB of memory
+ (Ampere or newer) and the int4 weights, ~21 GB, from Hugging Face
+ (apiplant/drama-q4). libcuda1 (installed by the NVIDIA driver package)
+ satisfies the runtime link; it does not by itself guarantee
+ driver/toolkit compatibility.

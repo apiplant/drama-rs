@@ -33,13 +33,29 @@ the next kernel's weights into L2 to hide launch gaps.
 | lm_head | only the 4097 sampleable rows (EOS + semantic band), bf16 |
 | embeddings, router | bf16 |
 
+## Install
+
+Prebuilt for Linux x86_64 (CUDA 12 runtime, Ampere or newer) on the
+[releases page](https://github.com/apiplant/drama-rs/releases), and packaged:
+
+```bash
+brew install apiplant/tap/drama-rs     # Homebrew on Linux
+sudo apt install drama-rs              # apt.apiplant.com
+sudo pacman -S drama-rs                # apiplant.github.io/pacman
+cargo install drama-rs                 # from crates.io (needs nvcc; DRAMA_CUDA_ARCH, default sm_89)
+```
+
+Repository setup for apt and pacman is in [`packaging/README.md`](packaging/README.md#using-the-packages).
+As a library: `cargo add drama-rs --no-default-features` (drops clap); see `src/lib.rs` for an example.
+
 ## Setup
 
 ```bash
 # 1. weights: download the prebuilt int4 build (no conversion needed)
 hf download apiplant/drama-q4 --local-dir models/drama-3-q4
 
-# 2. build (CUDA toolkit in /opt/cuda, or set CUDA_PATH; DRAMA_CUDA_ARCH defaults to sm_89)
+# 2. build (CUDA toolkit in /opt/cuda, or set CUDA_PATH; DRAMA_CUDA_ARCH defaults to sm_89,
+#    a comma-separated list such as sm_86,sm_89 builds for several GPUs)
 cargo build --release
 ```
 

@@ -5,3 +5,5 @@
 /ref/sglang
 /ref/sglang-omni
 __pycache__/
+website/node_modules/
+website/dist/

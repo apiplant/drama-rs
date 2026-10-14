@@ -1,10 +1,3 @@
-mod codec;
-mod engine;
-mod ffi;
-mod gpu;
-mod model;
-mod prompt;
-mod tts;
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -13,10 +6,11 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
-use engine::{Engine, SampleParams};
+use drama::engine::{Engine, SampleParams};
+use drama::{codec, gpu, model, tts};
 
 #[derive(Parser)]
-#[command(name = "drama", about = "Fish Audio Drama 3 text-to-speech")]
+#[command(name = "drama", version, about = "Fish Audio Drama 3 text-to-speech")]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
