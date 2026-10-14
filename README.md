@@ -36,16 +36,24 @@ the next kernel's weights into L2 to hide launch gaps.
 ## Setup
 
 ```bash
-# 1. weights (42 GB)
-hf download fishaudio/drama-3 --local-dir models/drama-3
+# 1. weights: download the prebuilt int4 build (no conversion needed)
+hf download apiplant/drama-q4 --local-dir models/drama-3-q4
 
-# 2. convert (needs a CUDA PyTorch; ~1 min per layer is plenty)
+# 2. build (CUDA toolkit in /opt/cuda, or set CUDA_PATH; DRAMA_CUDA_ARCH defaults to sm_89)
+cargo build --release
+```
+
+### Converting from the original checkpoint (optional)
+
+To rebuild the quantized weights yourself from the original FP8 checkpoint:
+
+```bash
+hf download fishaudio/drama-3 --local-dir models/drama-3   # 42 GB
+
+# needs a CUDA PyTorch; ~1 min per layer is plenty
 python tools/convert.py models/drama-3 models/drama-3-q4
 python tools/convert_codec.py models/drama-3/codec.pth models/drama-3-q4/codec.safetensors
 cp models/drama-3/tokenizer.json models/drama-3-q4/
-
-# 3. build (CUDA toolkit in /opt/cuda, or set CUDA_PATH; DRAMA_CUDA_ARCH defaults to sm_89)
-cargo build --release
 ```
 
 ## Usage
