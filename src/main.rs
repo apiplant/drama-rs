@@ -18,9 +18,10 @@ struct Cli {
 
 #[derive(clap::Args)]
 struct Common {
-    /// Directory produced by tools/convert.py
-    #[arg(long)]
-    model: PathBuf,
+    /// Model directory (tools/convert.py output). Default: models/drama-3-q4 or drama-q4 here, in the parent or
+    /// next to the binary, then ~/.cache/drama-rs/drama-q4, else downloaded there from Hugging Face (~21 GB)
+    #[arg(long, env = "DRAMA_MODEL")]
+    model: Option<PathBuf>,
     /// Context length (prompt rows + generated frames)
     #[arg(long, default_value_t = 4096)]
     max_len: usize,
@@ -38,12 +39,18 @@ struct Common {
 }
 
 impl Common {
+    fn model_dir(&self) -> Result<PathBuf> {
+        match &self.model {
+            Some(p) => Ok(p.clone()),
+            None => drama::download::default_model(),
+        }
+    }
     fn params(&self) -> SampleParams {
         SampleParams { temperature: self.temperature, top_k: self.top_k, top_p: self.top_p, pad: 0, seed: self.seed }
     }
     fn engine(&self) -> Result<Engine> {
         let st = gpu::Stream::new()?;
-        let model = model::Model::load(&self.model, &st)?;
+        let model = model::Model::load(&self.model_dir()?, &st)?;
         let engine = Engine::new(model, self.max_len, self.chunk)?;
         let (free, total) = gpu::mem_info()?;
         eprintln!("GPU memory: {:.2} GiB used of {:.2} GiB", (total - free) as f64 / (1u64 << 30) as f64, total as f64 / (1u64 << 30) as f64);
@@ -106,8 +113,9 @@ enum Cmd {
     },
     /// Decode raw codes ([frames][10] little-endian i32) to a WAV file.
     Decode {
-        #[arg(long)]
-        codec: PathBuf,
+        /// codec.safetensors (default: the one in the model directory)
+        #[arg(long = "codec", env = "DRAMA_CODEC")]
+        codec_path_opt: Option<PathBuf>,
         #[arg(long)]
         codes: PathBuf,
         #[arg(long)]
@@ -118,12 +126,33 @@ enum Cmd {
     },
     /// Encode a WAV file to codes ([frames][10] little-endian i32).
     Encode {
-        #[arg(long)]
-        codec: PathBuf,
+        /// codec.safetensors (default: the one in the model directory)
+        #[arg(long = "codec", env = "DRAMA_CODEC")]
+        codec_path_opt: Option<PathBuf>,
         #[arg(long)]
         wav: PathBuf,
         #[arg(long)]
         out: PathBuf,
+    },
+    /// Serve an HTTP API: POST /v1/speak renders text to WAV (see `drama::serve`).
+    Serve {
+        #[command(flatten)]
+        common: Common,
+        /// Address to listen on
+        #[arg(long, default_value = "127.0.0.1:8080")]
+        addr: String,
+        /// Voice to preload as NAME=WAV=TRANSCRIPT (repeatable); requests pick it with "voice": "NAME"
+        #[arg(long)]
+        voice: Vec<String>,
+        #[arg(long, default_value_t = 2048)]
+        max_new: usize,
+        #[arg(long, default_value_t = 4)]
+        first_chunk: usize,
+        #[arg(long, default_value_t = 16)]
+        stream_chunk: usize,
+        /// Generate the whole text at once instead of sentence by sentence (requests can override with "split")
+        #[arg(long)]
+        no_split: bool,
     },
     /// Measure decode speed.
     Bench {
@@ -134,6 +163,13 @@ enum Cmd {
         #[arg(long, default_value_t = 64)]
         prompt_rows: usize,
     },
+}
+
+fn codec_file(p: Option<PathBuf>) -> Result<PathBuf> {
+    match p {
+        Some(p) => Ok(p),
+        None => Ok(drama::download::default_model()?.join("codec.safetensors")),
+    }
 }
 
 fn read_i32(path: &PathBuf) -> Result<Vec<i32>> {
@@ -158,7 +194,7 @@ fn main() -> Result<()> {
                 anyhow::bail!("give --text, or --interactive to read lines from stdin");
             }
             let t_load = Instant::now();
-            let mut tts = tts::Tts::load(&common.model, common.max_len, common.chunk)?;
+            let mut tts = tts::Tts::load(&common.model_dir()?, common.max_len, common.chunk)?;
             let (free, total) = gpu::mem_info()?;
             eprintln!(
                 "ready in {:.1}s, GPU memory {:.2} / {:.2} GiB",
@@ -218,7 +254,27 @@ fn main() -> Result<()> {
                 p.finish()?;
             }
         }
-        Cmd::Decode { codec: codec_path, codes, out, stream_chunk } => {
+        Cmd::Serve { common, addr, voice, max_new, first_chunk, stream_chunk, no_split } => {
+            let defaults = drama::serve::Defaults { params: common.params(), max_new, first_chunk, chunk: stream_chunk, split: !no_split };
+            let (dir, max_len, chunk) = (common.model_dir()?, common.max_len, common.chunk);
+            let load = move || -> Result<_> {
+                let t = Instant::now();
+                let tts = tts::Tts::load(&dir, max_len, chunk)?;
+                let mut voices = std::collections::HashMap::new();
+                for v in &voice {
+                    let mut it = v.splitn(3, '=');
+                    let (Some(name), Some(wav), Some(text)) = (it.next(), it.next(), it.next()) else {
+                        anyhow::bail!("--voice wants NAME=WAV=TRANSCRIPT, got {v:?}");
+                    };
+                    voices.insert(name.to_string(), tts.reference(wav.as_ref(), text)?);
+                }
+                eprintln!("ready in {:.1}s", t.elapsed().as_secs_f64());
+                Ok((tts, voices))
+            };
+            drama::serve::run(load, defaults, &addr)?;
+        }
+        Cmd::Decode { codec_path_opt, codes, out, stream_chunk } => {
+            let codec_path = codec_file(codec_path_opt)?;
             let raw = read_i32(&codes)?;
             let codec = codec::Codec::load(&codec_path)?;
             let t1 = Instant::now();
@@ -235,7 +291,8 @@ fn main() -> Result<()> {
             eprintln!("decoded {} samples in {:.0} ms", audio.len(), t1.elapsed().as_secs_f64() * 1e3);
             codec::write_wav(&out, &audio)?;
         }
-        Cmd::Encode { codec: codec_path, wav, out } => {
+        Cmd::Encode { codec_path_opt, wav, out } => {
+            let codec_path = codec_file(codec_path_opt)?;
             let codec = codec::Codec::load(&codec_path)?;
             let (audio, sr) = codec::read_wav(&wav)?;
             let audio = codec::resample(&audio, sr, codec::SAMPLE_RATE);

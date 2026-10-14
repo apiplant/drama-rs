@@ -89,7 +89,12 @@ impl Tts {
     /// Encode a reference clip (any rate, mixed to mono) for voice cloning.
     pub fn reference(&self, wav: &Path, transcript: &str) -> Result<Reference> {
         let (audio, sr) = codec::read_wav(wav)?;
-        let audio = codec::resample(&audio, sr, codec::SAMPLE_RATE);
+        self.reference_audio(&audio, sr, transcript)
+    }
+
+    /// [`Tts::reference`] from mono samples at `sr` Hz.
+    pub fn reference_audio(&self, audio: &[f32], sr: u32, transcript: &str) -> Result<Reference> {
+        let audio = codec::resample(audio, sr, codec::SAMPLE_RATE);
         let flat = self.codec.encode(&audio)?;
         let frames = flat.len() / 10;
         let codes = (0..10).map(|c| (0..frames).map(|t| flat[t * 10 + c]).collect()).collect();

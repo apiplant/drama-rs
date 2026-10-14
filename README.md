@@ -46,7 +46,11 @@ cargo install drama-rs                 # from crates.io (needs nvcc; DRAMA_CUDA_
 ```
 
 Repository setup for apt and pacman is in [`packaging/README.md`](packaging/README.md#using-the-packages).
-As a library: `cargo add drama-rs --no-default-features` (drops clap); see `src/lib.rs` for an example.
+As a library: `cargo add drama-rs --no-default-features` (drops clap, ureq and ntex); see `src/lib.rs` for an example.
+
+`--model` is optional. Without it, drama uses `$DRAMA_MODEL`, then `models/drama-3-q4` or `drama-q4` in the
+working directory, its parent or next to the binary, then `~/.cache/drama-rs/drama-q4`. If none of those exists, it
+downloads [apiplant/drama-q4](https://huggingface.co/apiplant/drama-q4) (about 21 GB) into that cache directory.
 
 ## Setup
 
@@ -101,6 +105,28 @@ voice stays the same, and a sentence that still stalls is cut at a length cap an
 Sampling defaults follow the reference server: `--temperature 1.0 --top-k 30 --top-p 0.9`,
 plus repetition-aware sampling over the last 16 frames. Multi-speaker text uses
 `<|speaker:N|>` tags (N in 0..15); inline tags like `[laughs]` are passed through.
+
+### HTTP server
+
+```bash
+drama serve                                   # http://127.0.0.1:8080; --addr 0.0.0.0:8080 to expose it
+drama serve --voice me=voice.wav="Exactly what is said in voice.wav."   # preload voices (repeatable)
+
+curl localhost:8080/v1/speak -d '{"text": "Hello there."}' -o hello.wav
+curl localhost:8080/v1/speak -d 'Plain text works too.' -o hi.wav
+curl -sN "localhost:8080/v1/speak?stream=1" -d '{"text": "Streams while it renders."}' | pw-play -   # or ffplay -
+curl "localhost:8080/v1/voices?name=me&text=Exactly%20what%20is%20said." --data-binary @voice.wav
+curl localhost:8080/v1/speak -d '{"text": "In my voice.", "voice": "me", "seed": 7}' -o me.wav
+
+# dialogue: alice is <|speaker:0|>, bob <|speaker:1|> (or {"0": "alice", "1": "bob"})
+curl localhost:8080/v1/speak -o talk.wav -d '{"voices": ["alice", "bob"],
+  "text": "<|speaker:0|> Are you coming? <|speaker:1|> [sighs] Fine, give me a minute."}'
+```
+
+`POST /v1/speak` takes JSON (`text`, and optionally `voice`, `voices`, `stream`, `temperature`, `top_k`, `top_p`, `seed`,
+`split`, `max_new`) or the text as a plain body, and returns 44.1 kHz mono 16-bit WAV. With `stream` the WAV is sent
+while it is generated. `GET /v1/voices` lists the voices and `GET /health` returns `ok`. One GPU engine serves
+requests in order. The server is the `serve` feature (ntex), which needs Rust 1.97.
 
 Other commands: `encode` / `decode` (codec only), `bench` (decode speed), `trace` (engine tests).
 

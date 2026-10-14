@@ -16,9 +16,13 @@
 //! ```
 
 pub mod codec;
+#[cfg(feature = "download")]
+pub mod download;
 pub mod engine;
 pub mod ffi;
 pub mod gpu;
 pub mod model;
 pub mod prompt;
+#[cfg(feature = "serve")]
+pub mod serve;
 pub mod tts;

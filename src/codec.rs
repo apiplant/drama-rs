@@ -514,7 +514,16 @@ pub fn resample(x: &[f32], orig: u32, new: u32) -> Vec<f32> {
 
 /// Read a WAV file as mono f32 (channels averaged) and its sample rate.
 pub fn read_wav(path: &Path) -> Result<(Vec<f32>, u32)> {
-    let mut r = hound::WavReader::open(path).map_err(|e| anyhow!("{}: {e}", path.display()))?;
+    let r = hound::WavReader::open(path).map_err(|e| anyhow!("{}: {e}", path.display()))?;
+    wav_samples(r)
+}
+
+/// [`read_wav`] from bytes in memory (an uploaded file).
+pub fn read_wav_bytes(bytes: &[u8]) -> Result<(Vec<f32>, u32)> {
+    wav_samples(hound::WavReader::new(std::io::Cursor::new(bytes))?)
+}
+
+fn wav_samples<R: std::io::Read>(mut r: hound::WavReader<R>) -> Result<(Vec<f32>, u32)> {
     let spec = r.spec();
     let ch = spec.channels as usize;
     let samples: Vec<f32> = match spec.sample_format {
