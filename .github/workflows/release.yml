@@ -406,7 +406,8 @@ jobs:
 
       - name: Publish
         if: env.CARGO_REGISTRY_TOKEN != ''
-        run: cargo publish --locked
+        # ui/dist is built above and gitignored, but Cargo.toml `include`s it, so cargo sees it as uncommitted
+        run: cargo publish --locked --allow-dirty
 
   # The formula points at the release archive by URL, so it publishes after
   # the release exists. Guarded on its credential: a fork, or this repository
