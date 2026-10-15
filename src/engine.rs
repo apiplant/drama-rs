@@ -12,7 +12,7 @@ use anyhow::{bail, Result};
 
 use crate::ffi;
 use crate::gpu::{launched, Cublas, DevBuf, Graph, Pinned, Stream};
-use crate::model::{Dense, Mixer, Model, Q8};
+use crate::model::{Dense, Experts, Mixer, Model, Q8};
 
 pub const RAS_WINDOW: usize = 16;
 const ROUTER_PREFETCH: bool = false;
@@ -579,11 +579,19 @@ impl Engine {
             },
             "moe_permute",
         )?;
-        let (gq, gs) = layer.gate_up.expert(0);
-        let (dq, ds) = layer.down.expert(0);
         launched(
             unsafe {
-                ffi::dr_moe_prefill(gq, gs, dq, ds, h(&p.xp), i(&p.offsets), i(&p.counts), h(&p.ap), f(&p.yp), e as i32, d as i32, mi as i32, s)
+                match &layer.experts {
+                    Experts::Q4 { gate_up, down } => {
+                        let (gq, gs) = gate_up.expert(0);
+                        let (dq, ds) = down.expert(0);
+                        ffi::dr_moe_prefill(gq, gs, dq, ds, h(&p.xp), i(&p.offsets), i(&p.counts), h(&p.ap), f(&p.yp), e as i32, d as i32, mi as i32, s)
+                    }
+                    Experts::Fp8(x) => ffi::dr_moe_prefill_fp8(
+                        x.gu_w.ptr(), x.gu_s.ptr(), x.d_w.ptr(), x.d_s.ptr(), h(&p.xp), i(&p.offsets), i(&p.counts), h(&p.ap), f(&p.yp), e as i32, d as i32,
+                        mi as i32, s,
+                    ),
+                }
             },
             "moe_prefill",
         )?;
@@ -937,9 +945,15 @@ impl Engine {
             }
             let e = tc.num_experts;
             let topk = tc.num_experts_per_tok;
-            let (gq, gs) = layer.gate_up.expert(0);
-            let (dq, ds) = layer.down.expert(0);
-            let (gu, dn) = (&layer.gate_up, &layer.down);
+            // Expert weights as raw (q, scale) pointers; the router warms L2 only for the int4 layout.
+            let (gq, gs, dq, ds, pf_sizes, fp8) = match &layer.experts {
+                Experts::Q4 { gate_up: gu, down: dn } => {
+                    let (gq, gs) = gu.expert(0);
+                    let (dq, ds) = dn.expert(0);
+                    (gq, gs as *const u8, dq, ds as *const u8, [gu.n * gu.k / 2, gu.n * (gu.k / 64) * 4, dn.n * dn.k / 2, dn.n * (dn.k / 64) * 4], false)
+                }
+                Experts::Fp8(x) => (x.gu_w.ptr() as *const u8, x.gu_s.ptr() as *const u8, x.d_w.ptr() as *const u8, x.d_s.ptr() as *const u8, [0; 4], true),
+            };
             let router = &layer.router;
             let post = &layer.post_norm;
             ops.push(Op::weights(router.bf16() as *const u8, (e + 1) * d * 2, move |_, _| {
@@ -959,14 +973,14 @@ impl Engine {
                             f(&b.wts),
                             f(&b.sgate),
                             b.counter.ptr::<u32>(),
-                            if ROUTER_PREFETCH { gq as *const std::ffi::c_char } else { std::ptr::null() },
+                            if ROUTER_PREFETCH && !fp8 { gq as *const std::ffi::c_char } else { std::ptr::null() },
                             gs as *const std::ffi::c_char,
                             dq as *const std::ffi::c_char,
                             ds as *const std::ffi::c_char,
-                            gu.n * gu.k / 2,
-                            gu.n * (gu.k / 64) * 4,
-                            dn.n * dn.k / 2,
-                            dn.n * (dn.k / 64) * 4,
+                            pf_sizes[0],
+                            pf_sizes[1],
+                            pf_sizes[2],
+                            pf_sizes[3],
                             s,
                         )
                     },
@@ -979,12 +993,8 @@ impl Engine {
             ops.push(Op::plain(move |pf, pfb| {
                 launched(
                     unsafe {
-                        ffi::dr_moe_decode(
-                            gq,
-                            gs,
-                            dq,
-                            ds,
-                            sgq,
+                        if fp8 {
+                            ffi::dr_moe_decode_fp8(gq, gs as *const f32, dq, ds as *const f32, sgq,
                             sgs,
                             sdq,
                             sds,
@@ -1004,6 +1014,28 @@ impl Engine {
                             pfb,
                             s,
                         )
+                        } else {
+                            ffi::dr_moe_decode(gq, gs as *const u16, dq, ds as *const u16, sgq,
+                            sgs,
+                            sdq,
+                            sds,
+                            f(&b.x),
+                            i(&b.idx),
+                            f(&b.wts),
+                            f(&b.sgate),
+                            f(&b.x),
+                            f(&b.act),
+                            f(&b.x),
+                            d as i32,
+                            mi as i32,
+                            topk as i32,
+                            post.f32(),
+                            eps,
+                            pf,
+                            pfb,
+                            s,
+                        )
+                        }
                     },
                     "moe_decode",
                 )

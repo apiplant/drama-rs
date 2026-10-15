@@ -12,7 +12,7 @@ readme = "README.md"
 keywords = ["text-to-speech", "tts", "cuda", "fish-audio", "voice-cloning"]
 categories = ["multimedia::audio", "science", "command-line-utilities"]
 # the crate is the engine, its CUDA kernels and the binary; weights are downloaded separately
-include = ["/src/", "/kernels/", "/build.rs", "/README.md", "/LICENSE"]
+include = ["/src/", "/kernels/", "/ui/dist/", "/build.rs", "/README.md", "/LICENSE"]
 
 [lib]
 name = "drama"

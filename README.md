@@ -8,7 +8,11 @@ Fish Audio [Drama 3](https://huggingface.co/fishaudio/drama-3) text-to-speech on
 - **Codebook tower**: 13 transformer layers that predict codebooks 1–9 of every frame.
 - **Codec**: the Fish modded-DAC encoder (voice cloning) and decoder, streaming and exact.
 
-## Footprint and speed (RTX 4090)
+## Footprint and speed (RTX 4090, int4 experts)
+
+The default `--experts auto` uses the original FP8 experts when the checkpoint is present (higher quality, 1-2x
+real time on a 24 GB card instead of 8.9x). These numbers are for `--experts q4`; both modes are compared
+[below](#experts-where-they-run).
 
 | | |
 |---|---|
@@ -21,6 +25,57 @@ Fish Audio [Drama 3](https://huggingface.co/fishaudio/drama-3) text-to-speech on
 Each decode step is one CUDA-graph replay: lm_head → sampling (with RAS) → 13 tower layers
 with 9 codebook samplers → backbone step for the new frame. Weight-streaming GEMVs prefetch
 the next kernel's weights into L2 to hide launch gaps.
+
+## Experts: where they run
+
+The routed experts are 32 of the 35 B parameters, so they decide both quality and speed. Three places to run them:
+
+| `--experts` | what | GPU memory | host RAM |
+|---|---|---|---|
+| `q4` | converted int4 experts on the GPU | ~21 GiB | small |
+| `fp8-ram` | original FP8 in pinned host RAM, read over PCIe | ~4.5 GiB | ~32 GB |
+| `fp8-vram` | original FP8 on the GPU | ~36 GiB | small |
+| `fp8` | original FP8, **split by hardware**: as many layers in VRAM as fit, the rest in RAM | up to what's free | the remainder |
+| `auto` (default) | `fp8` if the original checkpoint is found and fits, else `q4` | | |
+
+`fp8` and `auto` look at the free VRAM and RAM at startup and print what they chose, for example
+`original FP8 experts: 23/40 layers in VRAM (18.5 GB), 17 in host RAM (13.7 GB)`. A bigger GPU puts more layers
+in VRAM, and with all 40 there the host RAM is not needed at all. `auto` falls back to `q4` if the original is
+missing or the RAM left for the offloaded layers is short. `fp8-vram` fails with the number of layers that would fit
+when the card is too small.
+
+Advanced controls:
+
+- `--fp8-vram-layers N`: put exactly N layers' experts in VRAM (with `--experts fp8` or `auto`), the rest in RAM.
+- `--vram-reserve-gb G` (default 3): VRAM kept free for the CUDA context, KV caches, scratch buffers and codec when
+  placing experts. Raise it for a larger `--max-len` or `--chunk`, or if another process uses the GPU.
+
+Measured on an RTX 4090 (24 GB, PCIe 4.0 x16), decoding one sentence:
+
+| | `q4` | `fp8` (auto: 23/40 layers in VRAM) | `--fp8-vram-layers 10` | `fp8-ram` |
+|---|---|---|---|---|
+| decode speed | 8.9x real time | 2.0x | 1.1x | 1.0x |
+| time to first audio | ~150 ms | ~490 ms | ~690 ms | ~1 s |
+| GPU memory | ~21 GiB | ~21.8 GiB | ~12 GiB | ~4.5 GiB |
+| host RAM | small | ~14 GB pinned | ~24 GB | ~32 GB |
+| KL vs original FP8 (main / heads) | 0.015 / 0.007-0.0085 | 0.010 / ~0.006 | same as `fp8` | same as `fp8` |
+
+Every FP8 placement computes the same numbers: the audio is byte-identical across them, only the memory the experts
+sit in changes. `fp8-vram` itself is not benchmarked: it needs a card with about 36 GB free, and the speed of the
+split placements is the reason to expect it to approach `q4`'s (decode is memory-bandwidth-bound, and FP8 reads twice
+the bytes of int4).
+
+Tradeoffs:
+
+- **FP8 is the higher-quality choice.** `q4` is for low latency, streaming into a conversation, or machines without
+  the RAM or the original checkpoint. Parakeet ASR transcribed both identically on the test sentence; the quality
+  gap is in the logit distributions (KL above), not a visible regression.
+- **Speed scales with how many layers sit in VRAM** and with PCIe bandwidth for the rest: decode reads ~1 GB of
+  experts per frame from RAM, so a PCIe 3.0 or x8 slot slows the RAM share (inferred, not measured).
+- **Startup is longer** with FP8: the experts are copied into pinned RAM and VRAM (13-30 s versus ~10 s).
+- **Disk:** FP8 needs both directories (60 GB); `q4` only `drama-3-q4` (21 GB).
+- Dense linears are int8 in every mode, so FP8 is closer to the original but not bit-exact. KL is teacher-forced on each
+  engine's own sampled frames over one utterance (`tools/check_engine.py --experts fp8|q4 --original models/drama-3`).
 
 ## Quantization
 
@@ -48,15 +103,37 @@ cargo install drama-rs                 # from crates.io (needs nvcc; DRAMA_CUDA_
 Repository setup for apt and pacman is in [`packaging/README.md`](packaging/README.md#using-the-packages).
 As a library: `cargo add drama-rs --no-default-features` (drops clap, ureq and ntex); see `src/lib.rs` for an example.
 
-`--model` is optional. Without it, drama uses `$DRAMA_MODEL`, then `models/drama-3-q4` or `drama-q4` in the
-working directory, its parent or next to the binary, then `~/.cache/drama-rs/drama-q4`. If none of those exists, it
-downloads [apiplant/drama-q4](https://huggingface.co/apiplant/drama-q4) (about 21 GB) into that cache directory.
+## Model directories
+
+Two directories make a model, and drama uses both when it can:
+
+| directory | what | size | needed for |
+|---|---|---|---|
+| `drama-3-q4` | converted build: dense int8 weights, int4 experts, codec, tokenizer | 21 GB | always (dense weights, codec, tokenizer) |
+| `drama-3` | the original [fishaudio/drama-3](https://huggingface.co/fishaudio/drama-3) checkpoint (block-FP8) | 39 GB | FP8 experts (optional, higher quality) |
+
+Each is looked up in `models/<name>` in the working directory, its parent or next to the binary, then in
+`~/.cache/drama-rs/<name>` (`$XDG_CACHE_HOME/drama-rs`), where they can be symlinks:
+
+```bash
+ln -s /path/to/drama-3-q4 ~/.cache/drama-rs/drama-3-q4
+ln -s /path/to/drama-3    ~/.cache/drama-rs/drama-3
+```
+
+- `--model` (or `$DRAMA_MODEL`) names either directory. Given the original, the int4 build is still found
+  (or downloaded) for the dense weights; `--fp8-model` (or `$DRAMA_FP8_MODEL`) names the original explicitly.
+- A missing `drama-3-q4` is downloaded from [apiplant/drama-q4](https://huggingface.co/apiplant/drama-q4)
+  (about 21 GB) into `~/.cache/drama-rs/drama-3-q4`. The old `drama-q4` name is still found. The original is never
+  downloaded for you: `hf download fishaudio/drama-3 --local-dir models/drama-3`.
+- `--experts auto` (default) runs the original FP8 experts if the original is found and fits, otherwise the int4
+  experts, and says which on startup. See the next section for the choices.
 
 ## Setup
 
 ```bash
-# 1. weights: download the prebuilt int4 build (no conversion needed)
+# 1. weights: the prebuilt int4 build (no conversion needed), plus the original checkpoint for FP8 experts
 hf download apiplant/drama-q4 --local-dir models/drama-3-q4
+hf download fishaudio/drama-3 --local-dir models/drama-3      # optional, 39 GB: higher quality, see below
 
 # 2. build (CUDA toolkit in /opt/cuda, or set CUDA_PATH; DRAMA_CUDA_ARCH defaults to sm_89,
 #    a comma-separated list such as sm_86,sm_89 builds for several GPUs)
@@ -77,6 +154,9 @@ cp models/drama-3/tokenizer.json models/drama-3-q4/
 ```
 
 ## Usage
+
+The examples use the default experts (FP8 when `models/drama-3` is there, split between VRAM and RAM by what
+the GPU has free, else int4). Add `--experts q4` for low latency (8.9x real time, first audio in ~150 ms).
 
 ```bash
 # speak to a file
@@ -127,6 +207,22 @@ curl localhost:8080/v1/speak -o talk.wav -d '{"voices": ["alice", "bob"],
 `split`, `max_new`) or the text as a plain body, and returns 44.1 kHz mono 16-bit WAV. With `stream` the WAV is sent
 while it is generated. `GET /v1/voices` lists the voices and `GET /health` returns `ok`. One GPU engine serves
 requests in order. The server is the `serve` feature (ntex), which needs Rust 1.97.
+
+Open `http://127.0.0.1:8080/` for the web UI, a small studio built into the binary: a script editor that highlights
+speaker and `[laughs]`-style tags, a voice library (drop in or record a clip), per-speaker casting, sampling controls,
+audio that plays while it is generated (buffered so it never stalls on a GPU slower than real time) and a list of takes
+with waveforms and WAV download. `/docs` has the API reference (OpenAPI 3.1 at `/openapi.json`).
+
+![The drama web UI](docs/ui.png)
+
+When the [`fluid-speech`](https://fluid-speech-rs.apiplant.com) binary is on `PATH` (or named by `$FLUID_SPEECH`), the
+server can transcribe: `POST /v1/transcribe` takes an audio clip and returns `{"text": ...}`, and registering a voice
+without `text` transcribes the clip for you (the UI does this as soon as you add one). It runs on the CPU so the GPU stays
+with the TTS model (`DRAMA_TRANSCRIBE_DEVICE` overrides that). Without the binary transcription is disabled: `GET /v1/info`
+says so, the UI shows a link to install it, and you type transcripts by hand. `fluid-speech` is not bundled.
+
+The UI lives in `ui/` (Solid 2 + Tailwind) and is embedded at build time: run `pnpm install && pnpm build` in `ui/`
+before `cargo build`, or the binary serves the API without it.
 
 Other commands: `encode` / `decode` (codec only), `bench` (decode speed), `trace` (engine tests).
 

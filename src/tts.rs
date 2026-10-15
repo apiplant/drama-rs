@@ -15,7 +15,7 @@ use tokenizers::Tokenizer;
 
 use crate::codec::{self, Codec};
 use crate::engine::{Engine, SampleParams};
-use crate::model::Model;
+use crate::model::{ExpertMode, Model};
 use crate::prompt::{self, Reference};
 
 pub struct Tts {
@@ -78,9 +78,14 @@ impl Player {
 
 impl Tts {
     pub fn load(model_dir: &Path, max_len: usize, chunk: usize) -> Result<Self> {
+        Self::load_with(model_dir, max_len, chunk, &ExpertMode::Q4)
+    }
+
+    /// [`Tts::load`] with the routed experts from `experts` (int4 on the GPU, or the original FP8 in host RAM).
+    pub fn load_with(model_dir: &Path, max_len: usize, chunk: usize, experts: &ExpertMode) -> Result<Self> {
         let codec = Codec::load(&model_dir.join("codec.safetensors"))?;
         let st = crate::gpu::Stream::new()?;
-        let model = Model::load(model_dir, &st)?;
+        let model = Model::load_with(model_dir, &st, experts)?;
         let engine = Engine::new(model, max_len, chunk)?;
         let tok = Tokenizer::from_file(model_dir.join("tokenizer.json")).map_err(|e| anyhow!("tokenizer: {e}"))?;
         Ok(Self { engine, codec, tok })

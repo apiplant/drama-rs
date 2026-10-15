@@ -54,7 +54,11 @@ drama speak --model drama-q4 --interactive --play             # keep the model l
 
       <Section>
         <H2>serve</H2>
-        <P>An HTTP server around one loaded engine; requests queue for the GPU.</P>
+        <P>
+          An HTTP server around one loaded engine; requests queue for the GPU. Open its address in a browser for the
+          built-in web UI: a studio with a script editor, a voice library, live streaming and a list of takes. The API
+          reference is at <IC>/docs</IC>.
+        </P>
         <CopyBlock
           command={`drama serve --addr 127.0.0.1:8080 --voice me=voice.wav="Exactly what is said in voice.wav."
 
@@ -67,7 +71,9 @@ curl localhost:8080/v1/speak -o talk.wav -d '{"voices": ["alice", "bob"], "text"
         <FlagTable
           rows={[
             { flag: "POST /v1/speak", meaning: "JSON {text, voice?, voices? (list = speakers 0, 1, ... or {\"N\": name}), stream?, temperature?, top_k?, top_p?, seed?, split?, max_new?} or plain text. Returns 44.1 kHz mono WAV; streamed with stream: true or ?stream=1." },
-            { flag: "POST /v1/voices?name=&text=", meaning: "Register a voice: the body is a WAV clip, text its transcript." },
+            { flag: "POST /v1/voices?name=&text=", meaning: "Register a voice: the body is a WAV clip, text its transcript. Leave text out to have the clip transcribed with fluid-speech." },
+            { flag: "POST /v1/transcribe", meaning: "Body is an audio clip; returns {text}. Needs the fluid-speech binary on PATH (fluid-speech-rs.apiplant.com); 501 without it. Runs on the CPU." },
+            { flag: "GET /v1/info", meaning: "Version, sample rate, and whether transcription is enabled." },
             { flag: "GET /v1/voices, GET /health", meaning: "Registered voice names; liveness." },
           ]}
         />

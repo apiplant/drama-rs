@@ -16,12 +16,49 @@ struct Cli {
     cmd: Cmd,
 }
 
+#[derive(clap::ValueEnum, Clone, Copy, PartialEq)]
+enum Experts {
+    Auto,
+    Q4,
+    Fp8,
+    Fp8Vram,
+    Fp8Ram,
+}
+
+impl From<Experts> for drama::download::Want {
+    fn from(e: Experts) -> Self {
+        match e {
+            Experts::Auto => Self::Auto,
+            Experts::Q4 => Self::Q4,
+            Experts::Fp8 => Self::Fp8,
+            Experts::Fp8Vram => Self::Fp8Vram,
+            Experts::Fp8Ram => Self::Fp8Ram,
+        }
+    }
+}
+
 #[derive(clap::Args)]
 struct Common {
-    /// Model directory (tools/convert.py output). Default: models/drama-3-q4 or drama-q4 here, in the parent or
-    /// next to the binary, then ~/.cache/drama-rs/drama-q4, else downloaded there from Hugging Face (~21 GB)
+    /// The int4 build (tools/convert.py output; dense weights, codec, tokenizer), or the original fishaudio/drama-3
+    /// checkpoint (then the int4 build is found separately). Default: `models/drama-3-q4` or `drama-q4` here, in the
+    /// parent or next to the binary, then ~/.cache/drama-rs/drama-3-q4, else downloaded there (~21 GB)
     #[arg(long, env = "DRAMA_MODEL")]
     model: Option<PathBuf>,
+    /// Routed experts. `auto` (default): original FP8 when the checkpoint is found and fits, else int4. `fp8`: original
+    /// FP8, as many layers in VRAM as fit and the rest in pinned host RAM (read over PCIe). `fp8-vram`: all in VRAM
+    /// (~35 GB card). `fp8-ram`: all in host RAM (~32 GB). `q4`: converted int4 on the GPU, ~8x faster
+    #[arg(long, value_enum, default_value_t = Experts::Auto)]
+    experts: Experts,
+    /// Advanced: how many layers' FP8 experts to put in VRAM (default: as many as fit), the rest in host RAM
+    #[arg(long)]
+    fp8_vram_layers: Option<usize>,
+    /// Advanced: VRAM (GB) kept free for the KV caches, scratch, codec and CUDA context when placing FP8 experts
+    #[arg(long, default_value_t = 3.0)]
+    vram_reserve_gb: f64,
+    /// The original fishaudio/drama-3 checkpoint for fp8 experts. Default: `models/drama-3` (searched like the
+    /// model), then ~/.cache/drama-rs/drama-3
+    #[arg(long, env = "DRAMA_FP8_MODEL")]
+    fp8_model: Option<PathBuf>,
     /// Context length (prompt rows + generated frames)
     #[arg(long, default_value_t = 4096)]
     max_len: usize,
@@ -39,18 +76,24 @@ struct Common {
 }
 
 impl Common {
-    fn model_dir(&self) -> Result<PathBuf> {
-        match &self.model {
-            Some(p) => Ok(p.clone()),
-            None => drama::download::default_model(),
-        }
+    /// Find the model directories and choose the experts.
+    fn resolve(&self) -> Result<drama::download::Resolved> {
+        let choice = drama::download::Choice {
+            want: self.experts.into(),
+            vram_layers: self.fp8_vram_layers,
+            reserve_bytes: (self.vram_reserve_gb * (1u64 << 30) as f64) as u64,
+        };
+        let r = drama::download::resolve(self.model.as_deref(), self.fp8_model.as_deref(), choice)?;
+        eprintln!("experts: {} (dense weights from {})", r.summary, r.dir.display());
+        Ok(r)
     }
     fn params(&self) -> SampleParams {
         SampleParams { temperature: self.temperature, top_k: self.top_k, top_p: self.top_p, pad: 0, seed: self.seed }
     }
     fn engine(&self) -> Result<Engine> {
         let st = gpu::Stream::new()?;
-        let model = model::Model::load(&self.model_dir()?, &st)?;
+        let r = self.resolve()?;
+        let model = model::Model::load_with(&r.dir, &st, &r.experts)?;
         let engine = Engine::new(model, self.max_len, self.chunk)?;
         let (free, total) = gpu::mem_info()?;
         eprintln!("GPU memory: {:.2} GiB used of {:.2} GiB", (total - free) as f64 / (1u64 << 30) as f64, total as f64 / (1u64 << 30) as f64);
@@ -194,7 +237,8 @@ fn main() -> Result<()> {
                 anyhow::bail!("give --text, or --interactive to read lines from stdin");
             }
             let t_load = Instant::now();
-            let mut tts = tts::Tts::load(&common.model_dir()?, common.max_len, common.chunk)?;
+            let r = common.resolve()?;
+            let mut tts = tts::Tts::load_with(&r.dir, common.max_len, common.chunk, &r.experts)?;
             let (free, total) = gpu::mem_info()?;
             eprintln!(
                 "ready in {:.1}s, GPU memory {:.2} / {:.2} GiB",
@@ -256,10 +300,11 @@ fn main() -> Result<()> {
         }
         Cmd::Serve { common, addr, voice, max_new, first_chunk, stream_chunk, no_split } => {
             let defaults = drama::serve::Defaults { params: common.params(), max_new, first_chunk, chunk: stream_chunk, split: !no_split };
-            let (dir, max_len, chunk) = (common.model_dir()?, common.max_len, common.chunk);
+            let r = common.resolve()?;
+            let (dir, experts, max_len, chunk) = (r.dir, r.experts, common.max_len, common.chunk);
             let load = move || -> Result<_> {
                 let t = Instant::now();
-                let tts = tts::Tts::load(&dir, max_len, chunk)?;
+                let tts = tts::Tts::load_with(&dir, max_len, chunk, &experts)?;
                 let mut voices = std::collections::HashMap::new();
                 for v in &voice {
                     let mut it = v.splitn(3, '=');

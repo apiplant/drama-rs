@@ -29,6 +29,10 @@ absent is skipped rather than failing the release.
 
 ## Builds
 
+- `ui`: `pnpm build` in `ui/`, uploaded as the `ui-dist` artifact. `binary`,
+  `binary-arch` and `crates-io` download it into `ui/dist` before building, and
+  `DRAMA_REQUIRE_UI=1` makes build.rs fail instead of embedding no web UI. The
+  crate ships `ui/dist`, so `cargo install` gets the UI without Node.
 - `binary`: an `nvidia/cuda:12.8.1-devel-ubuntu22.04` container (nvcc and the
   CUDA libraries, no GPU needed), `cargo build --profile dist` for
   `DRAMA_CUDA_ARCH=sm_80,sm_86,sm_89,sm_90,sm_120` (machine code for each, PTX

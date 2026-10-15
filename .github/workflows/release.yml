@@ -31,12 +31,45 @@ env:
   # architecture (A10/3090 sm_86, 4090/L40 sm_89, A100 sm_80, H100 sm_90,
   # 5090 sm_120) plus PTX of the newest, instead of asking nvidia-smi.
   DRAMA_CUDA_ARCH: "sm_80,sm_86,sm_89,sm_90,sm_120"
+  # build.rs embeds ui/dist in the binary; fail rather than ship one without the web UI.
+  DRAMA_REQUIRE_UI: "1"
 
 jobs:
+  # The web UI `drama serve` embeds at /. Built once; every cargo build below
+  # downloads it into ui/dist first.
+  ui:
+    name: web UI
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: ui/pnpm-lock.yaml
+
+      - name: Build
+        working-directory: ui
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm build
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ui-dist
+          path: ui/dist
+          if-no-files-found: error
+
   # nvcc and the CUDA headers/libraries are needed at build time, not a GPU;
   # the devel image provides them. 12.8 is the first toolkit with sm_120.
   binary:
     name: x86_64-unknown-linux-gnu (cuda)
+    needs: ui
     runs-on: ubuntu-22.04
     container: nvidia/cuda:12.8.1-devel-ubuntu22.04
     env:
@@ -48,6 +81,11 @@ jobs:
           apt-get install -y --no-install-recommends curl build-essential pkg-config ca-certificates git
 
       - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ui-dist
+          path: ui/dist
 
       - name: Install Rust
         run: |
@@ -90,6 +128,7 @@ jobs:
   # keeps the link and the `cuda` dependency in step.
   binary-arch:
     name: x86_64-unknown-linux-gnu (cuda, arch)
+    needs: ui
     runs-on: ubuntu-latest
     # Rolling Arch can break a CUDA build before anything in this repository
     # changes; the Arch package then falls back to the generic archive instead
@@ -101,6 +140,11 @@ jobs:
         run: pacman -Sy --noconfirm --needed rust cuda git
 
       - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ui-dist
+          path: ui/dist
 
       - name: Build
         shell: bash
@@ -334,7 +378,7 @@ jobs:
   # it, and the build script runs nvcc, so this runs in the CUDA container too.
   crates-io:
     name: crates.io
-    needs: release
+    needs: [ui, release]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-22.04
     container: nvidia/cuda:12.8.1-devel-ubuntu22.04
@@ -349,6 +393,11 @@ jobs:
           apt-get install -y --no-install-recommends curl build-essential pkg-config ca-certificates git
 
       - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ui-dist
+          path: ui/dist
 
       - name: Install Rust
         run: |

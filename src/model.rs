@@ -1,14 +1,14 @@
 //! Model configuration and the converted weights, uploaded to the GPU.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
 use memmap2::Mmap;
 use safetensors::{Dtype, SafeTensors};
 use serde::Deserialize;
 
-use crate::gpu::{DevBuf, Stream};
+use crate::gpu::{DevBuf, Pinned, Stream};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct RopeParameters {
@@ -150,6 +150,50 @@ pub enum Mixer {
     Full(FullAttn),
 }
 
+/// Which routed-expert weights to run.
+#[derive(Debug, Clone, Default)]
+pub enum ExpertMode {
+    /// The converted int4 experts, resident on the GPU.
+    #[default]
+    Q4,
+    /// The original block-FP8 experts from this checkpoint directory (fishaudio/drama-3). The first `vram_layers`
+    /// layers' experts are uploaded to the GPU, the rest stay in pinned host RAM and are read by the kernels over
+    /// PCIe. Everything else stays as converted.
+    Fp8 { dir: PathBuf, vram_layers: usize },
+}
+
+/// Expert weights of one tensor: pinned host memory (read over PCIe) or device memory.
+pub enum ExpertBuf<T: Copy> {
+    Host(Pinned<T>),
+    Device(DevBuf),
+}
+
+impl<T: Copy> ExpertBuf<T> {
+    pub fn ptr(&self) -> *const T {
+        match self {
+            Self::Host(p) => p.ptr(),
+            Self::Device(d) => d.ptr::<T>(),
+        }
+    }
+    pub fn on_gpu(&self) -> bool {
+        matches!(self, Self::Device(_))
+    }
+}
+
+/// Original block-FP8 (e4m3, 128x128 blocks, f32 scale_inv) routed experts of one layer.
+/// gate_up: w [E, 2I, H] (gate rows, then up rows), s [E, 2I/128, H/128]; down: w [E, H, I], s [E, H/128, I/128].
+pub struct Fp8Experts {
+    pub gu_w: ExpertBuf<u8>,
+    pub gu_s: ExpertBuf<f32>,
+    pub d_w: ExpertBuf<u8>,
+    pub d_s: ExpertBuf<f32>,
+}
+
+pub enum Experts {
+    Q4 { gate_up: Q4, down: Q4 },
+    Fp8(Fp8Experts),
+}
+
 pub struct Layer {
     pub input_norm: Dense,
     pub post_norm: Dense,
@@ -157,8 +201,7 @@ pub struct Layer {
     pub router: Dense,
     pub shared_gate_up: Q8,
     pub shared_down: Q8,
-    pub gate_up: Q4,
-    pub down: Q4,
+    pub experts: Experts,
 }
 
 pub struct TowerLayer {
@@ -275,6 +318,11 @@ fn inv_freq(theta: f64, rot: usize) -> Vec<f32> {
 
 impl Model {
     pub fn load(dir: &Path, stream: &Stream) -> Result<Self> {
+        Self::load_with(dir, stream, &ExpertMode::Q4)
+    }
+
+    /// [`Model::load`] with the routed experts taken from `experts`.
+    pub fn load_with(dir: &Path, stream: &Stream, experts: &ExpertMode) -> Result<Self> {
         let meta: Meta = serde_json::from_slice(&std::fs::read(dir.join("drama.json")).context("read drama.json")?)?;
         if meta.format != "drama-rs-v1" || meta.q4_group != 64 || meta.q8_group != 128 {
             bail!("unsupported converted format in {}", dir.display());
@@ -285,6 +333,10 @@ impl Model {
         let t0 = std::time::Instant::now();
         let mut uploaded = 0usize;
 
+        let fp8 = match experts {
+            ExpertMode::Fp8 { dir, .. } => Some(Fp8Source::open(dir)?),
+            ExpertMode::Q4 => None,
+        };
         let mut layers = Vec::with_capacity(tc.num_hidden_layers);
         for i in 0..tc.num_hidden_layers {
             let file = File::open(&dir.join(format!("layer{i:02}.safetensors")))?;
@@ -313,8 +365,13 @@ impl Model {
                 router: l.bf16("moe.router")?,
                 shared_gate_up: l.q8("moe.shared_gate_up")?,
                 shared_down: l.q8("moe.shared_down")?,
-                gate_up: l.q4("moe.gate_up")?,
-                down: l.q4("moe.down")?,
+                experts: match &fp8 {
+                    Some(src) => {
+                        let on_gpu = matches!(experts, ExpertMode::Fp8 { vram_layers, .. } if i < *vram_layers);
+                        Experts::Fp8(src.layer(i, tc.num_experts, tc.hidden_size, tc.moe_intermediate_size, on_gpu.then_some(stream))?)
+                    }
+                    None => Experts::Q4 { gate_up: l.q4("moe.gate_up")?, down: l.q4("moe.down")? },
+                },
             });
             stream.sync()?;
             eprint!("\rloading weights: layer {}/{}", i + 1, tc.num_hidden_layers);
@@ -398,6 +455,141 @@ impl Model {
             tower_inv_freq,
             embed_tokens,
         })
+    }
+}
+
+/// What a model needs, for choosing where the experts go before anything is loaded.
+#[derive(Debug, Clone, Copy)]
+pub struct Sizes {
+    pub layers: usize,
+    /// FP8 experts of one layer (weights + scales).
+    pub fp8_layer_bytes: u64,
+    /// GPU bytes of everything except the routed experts (dense weights, tower, heads), roughly.
+    pub dense_bytes: u64,
+}
+
+/// [`Sizes`] of the converted model in `dir`, from its config and the safetensors headers.
+pub fn sizes(dir: &Path) -> Result<Sizes> {
+    let meta: Meta = serde_json::from_slice(&std::fs::read(dir.join("drama.json")).context("read drama.json")?)?;
+    let tc = &meta.config.text_config;
+    let (e, h, i) = (tc.num_experts as u64, tc.hidden_size as u64, tc.moe_intermediate_size as u64);
+    let fp8_layer_bytes = e * (2 * i * h + h * i) + 4 * e * ((2 * i / 128) * (h / 128) + (h / 128) * (i / 128));
+    let mut dense_bytes = std::fs::metadata(dir.join("tower.safetensors")).map_or(0, |m| m.len());
+    for l in 0..tc.num_hidden_layers {
+        let file = File::open(&dir.join(format!("layer{l:02}.safetensors")))?;
+        for (name, t) in file.st()?.tensors() {
+            if !name.starts_with("moe.gate_up") && !name.starts_with("moe.down") {
+                dense_bytes += t.data().len() as u64;
+            }
+        }
+    }
+    Ok(Sizes { layers: tc.num_hidden_layers, fp8_layer_bytes, dense_bytes })
+}
+
+/// The original checkpoint's shards and index, for reading routed experts.
+struct Fp8Source {
+    dir: PathBuf,
+    weight_map: HashMap<String, String>,
+}
+
+/// A raw destination pointer handed to copy threads that write disjoint ranges.
+#[derive(Clone, Copy)]
+struct Dst<T>(*mut T);
+unsafe impl<T> Send for Dst<T> {}
+unsafe impl<T> Sync for Dst<T> {}
+impl<T> Dst<T> {
+    // a method, so closures capture the Send wrapper rather than the raw field
+    fn get(self) -> *mut T {
+        self.0
+    }
+}
+
+impl Fp8Source {
+    fn open(dir: &Path) -> Result<Self> {
+        #[derive(Deserialize)]
+        struct Index {
+            weight_map: HashMap<String, String>,
+        }
+        let p = dir.join("model.safetensors.index.json");
+        let idx: Index = serde_json::from_slice(&std::fs::read(&p).with_context(|| format!("read {}", p.display()))?)?;
+        Ok(Self { dir: dir.to_path_buf(), weight_map: idx.weight_map })
+    }
+
+    /// Copy layer `li`'s experts into pinned memory, checking dtypes and shapes.
+    /// With `gpu`, the layer is then uploaded to the GPU (via that stream) and the pinned copy dropped.
+    fn layer(&self, li: usize, e: usize, h: usize, i: usize, gpu: Option<&Stream>) -> Result<Fp8Experts> {
+        const B: usize = 128;
+        if h % B != 0 || i % B != 0 {
+            bail!("fp8 experts: hidden {h} / intermediate {i} not a multiple of {B}");
+        }
+        let gu_w = Pinned::<u8>::new(e * 2 * i * h)?;
+        let gu_s = Pinned::<f32>::new(e * (2 * i / B) * (h / B))?;
+        let d_w = Pinned::<u8>::new(e * h * i)?;
+        let d_s = Pinned::<f32>::new(e * (h / B) * (i / B))?;
+        let prefix = format!("model.language_model.layers.{li}.mlp.experts");
+        // The layer's tensors may sit in several shards.
+        let mut shards: HashMap<&str, File> = HashMap::new();
+        for ex in 0..e {
+            let name = format!("{prefix}.{ex}.gate_proj.weight");
+            let shard = self.weight_map.get(&name).ok_or_else(|| anyhow!("{name} not in the checkpoint index"))?;
+            if !shards.contains_key(shard.as_str()) {
+                shards.insert(shard, File::open(&self.dir.join(shard))?);
+            }
+        }
+        let sts: HashMap<&str, SafeTensors<'_>> = shards.iter().map(|(k, f)| Ok((*k, f.st()?))).collect::<Result<_>>()?;
+        let (gw, gs, dw, ds) = (Dst(gu_w.ptr()), Dst(gu_s.ptr()), Dst(d_w.ptr()), Dst(d_s.ptr()));
+        let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).min(16);
+        let per = e.div_ceil(threads);
+        std::thread::scope(|sc| -> Result<()> {
+            let mut handles = Vec::new();
+            for t in 0..threads {
+                let (sts, prefix, wm) = (&sts, &prefix, &self.weight_map);
+                handles.push(sc.spawn(move || -> Result<()> {
+                    let get = |ex: usize, part: &str, scale: bool, rows: usize, cols: usize| -> Result<&[u8]> {
+                        let name = format!("{prefix}.{ex}.{part}.weight{}", if scale { "_scale_inv" } else { "" });
+                        let shard = wm.get(&name).ok_or_else(|| anyhow!("{name} not in the checkpoint index"))?;
+                        let t = sts[shard.as_str()].tensor(&name).map_err(|er| anyhow!("{name}: {er}"))?;
+                        let (dt, shape) = if scale { (Dtype::F32, vec![rows / B, cols / B]) } else { (Dtype::F8_E4M3, vec![rows, cols]) };
+                        if t.dtype() != dt || t.shape() != shape {
+                            bail!("{name}: {:?} {:?}, expected {dt:?} {shape:?}", t.dtype(), t.shape());
+                        }
+                        Ok(t.data())
+                    };
+                    for ex in (t * per)..((t + 1) * per).min(e) {
+                        // gate rows then up rows
+                        let (g, u) = (get(ex, "gate_proj", false, i, h)?, get(ex, "up_proj", false, i, h)?);
+                        let (gsc, usc) = (get(ex, "gate_proj", true, i, h)?, get(ex, "up_proj", true, i, h)?);
+                        let d = get(ex, "down_proj", false, h, i)?;
+                        let dsc = get(ex, "down_proj", true, h, i)?;
+                        unsafe {
+                            let w = gw.get().add(ex * 2 * i * h);
+                            std::ptr::copy_nonoverlapping(g.as_ptr(), w, g.len());
+                            std::ptr::copy_nonoverlapping(u.as_ptr(), w.add(g.len()), u.len());
+                            let s = gs.get().add(ex * (2 * i / B) * (h / B)) as *mut u8;
+                            std::ptr::copy_nonoverlapping(gsc.as_ptr(), s, gsc.len());
+                            std::ptr::copy_nonoverlapping(usc.as_ptr(), s.add(gsc.len()), usc.len());
+                            std::ptr::copy_nonoverlapping(d.as_ptr(), dw.get().add(ex * h * i), d.len());
+                            std::ptr::copy_nonoverlapping(dsc.as_ptr(), ds.get().add(ex * (h / B) * (i / B)) as *mut u8, dsc.len());
+                        }
+                    }
+                    Ok(())
+                }));
+            }
+            for hd in handles {
+                hd.join().map_err(|_| anyhow!("fp8 expert copy thread panicked"))??;
+            }
+            Ok(())
+        })?;
+        let Some(st) = gpu else {
+            return Ok(Fp8Experts { gu_w: ExpertBuf::Host(gu_w), gu_s: ExpertBuf::Host(gu_s), d_w: ExpertBuf::Host(d_w), d_s: ExpertBuf::Host(d_s) });
+        };
+        fn up<T: Copy>(p: &Pinned<T>, st: &Stream) -> Result<ExpertBuf<T>> {
+            let bytes = unsafe { std::slice::from_raw_parts(p.ptr() as *const u8, p.len() * std::mem::size_of::<T>()) };
+            Ok(ExpertBuf::Device(DevBuf::from_bytes(bytes, st)?))
+        }
+        let out = Fp8Experts { gu_w: up(&gu_w, st)?, gu_s: up(&gu_s, st)?, d_w: up(&d_w, st)?, d_s: up(&d_s, st)? };
+        st.sync()?; // the pinned staging copies are dropped on return
+        Ok(out)
     }
 }
 
