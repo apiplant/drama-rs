@@ -160,18 +160,18 @@ the GPU has free, else int4). Add `--experts q4` for low latency (8.9x real time
 
 ```bash
 # speak to a file
-./target/release/drama speak --model models/drama-3-q4 --text "Hello there." --out hello.wav
+drama speak --model models/drama-3-q4 --text "Hello there." --out hello.wav
 
 # stream to the speakers while generating (PipeWire / pw-play)
-./target/release/drama speak --model models/drama-3-q4 --text "Hello there." --play
+drama speak --model models/drama-3-q4 --text "Hello there." --play
 
 # clone a voice from a reference clip and its transcript
-./target/release/drama speak --model models/drama-3-q4 --play \
+drama speak --model models/drama-3-q4 --play \
   --ref-wav voice.wav --ref-text "Exactly what is said in voice.wav." \
   --text "<|speaker:0|> [sighs] Fine. If we miss it, it's on you."
 
 # keep the model loaded and speak every line typed on stdin
-./target/release/drama speak --model models/drama-3-q4 --interactive --play
+drama speak --model models/drama-3-q4 --interactive --play
 ```
 
 Text is generated one sentence at a time, like the reference server's streaming endpoint.
@@ -237,7 +237,7 @@ $PY tools/convert.py test/tiny-src test/tiny
 $PY tools/check_engine.py test/tiny                     # engine logits vs reference, per step
 # int4 vs original FP8 (KL, top-1), on a real prompt: random rows make the model emit EOS,
 # which never happens mid-utterance in real use and skews the codebook-head comparison
-./target/release/drama speak --model models/drama-3-q4 --text "..." --out x.wav --prompt-out test/work/prompt.bin
+drama speak --model models/drama-3-q4 --text "..." --out x.wav --prompt-out test/work/prompt.bin
 $PY tools/check_engine.py models/drama-3-q4 --original models/drama-3 --rows-file test/work/prompt.bin --steps 12
 $PY tools/check_codec.py models/drama-3/codec.pth clip.wav test/work models/drama-3-q4/codec.safetensors
 ```
