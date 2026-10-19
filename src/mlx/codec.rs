@@ -436,10 +436,13 @@ impl Inner {
 impl Codec {
     pub fn load(path: &Path) -> Result<Self> {
         crate::apple::init()?;
+        let tensors = Array::load_safetensors(path)?;
+        // Safetensors loading is lazy and refers to this thread's CPU stream.
+        // Materialize those reads before the streaming decoder uses the arrays
+        // on its own thread, where that loading stream is unavailable.
+        mlx_rs::transforms::eval(tensors.values())?;
         Ok(Self {
-            inner: Mutex::new(Inner {
-                t: Array::load_safetensors(path)?,
-            }),
+            inner: Mutex::new(Inner { t: tensors }),
         })
     }
     pub fn stream(&self) -> Result<DecodeStream> {
@@ -479,6 +482,37 @@ impl Codec {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn loaded_codec_weights_can_be_used_on_the_audio_thread() -> Result<()> {
+        use safetensors::{tensor::TensorView, Dtype as SafeDtype};
+        let bytes: Vec<u8> = [1.0f32, 2.0, 3.0, 4.0]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect();
+        let view = TensorView::new(SafeDtype::F32, vec![2, 2], &bytes)?;
+        let path = std::env::temp_dir().join(format!(
+            "drama-codec-thread-{}-{}.safetensors",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos()
+        ));
+        safetensors::tensor::serialize_to_file([("w", view)], &None, &path)?;
+        let codec = Codec::load(&path)?;
+        std::fs::remove_file(path)?;
+        let result = std::thread::spawn(move || -> Result<Vec<f32>> {
+            let inner = codec
+                .inner
+                .lock()
+                .map_err(|_| anyhow::anyhow!("codec mutex poisoned"))?;
+            vec_f32(&inner.gemm(&Array::from_slice(&[1.0f32, 1.0], &[1, 2]), "w")?)
+        })
+        .join()
+        .map_err(|_| anyhow::anyhow!("audio thread panicked"))??;
+        assert_eq!(result, vec![3.0, 7.0]);
+        Ok(())
+    }
+
     #[test]
     fn causal_convolution_and_transpose_keep_chunk_histories() -> Result<()> {
         crate::apple::init()?;

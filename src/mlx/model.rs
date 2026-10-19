@@ -109,7 +109,12 @@ impl Model {
             tower.push(TowerLayer { tensors, linears });
         }
         let heads = Quantized::q8(take(&mut ts, "heads.q8")?, take(&mut ts, "heads.s")?)?;
-        let codebook_emb = take(&mut ts, "codebook_emb")?;
+        let codebook_emb = codebook_embeddings(
+            take(&mut ts, "codebook_emb")?,
+            cfg.audio_decoder_config.num_codebooks,
+            cfg.audio_decoder_config.vocab_size,
+            cfg.text_config.hidden_size,
+        )?;
         let mut gs = Array::load_safetensors(dir.join("globals.safetensors"))?;
         Ok(Self {
             cfg,
@@ -121,6 +126,34 @@ impl Model {
             final_norm: take(&mut gs, "final_norm")?,
             embed_tokens: take(&mut gs, "embed_tokens")?,
         })
+    }
+}
+
+/// Converted checkpoints flatten the codebook and vocabulary axes to [NCB * V, D].
+/// Normalize that table once so both backbone and tower gather by (codebook, code).
+fn codebook_embeddings(data: Array, codebooks: usize, vocab: usize, dim: usize) -> Result<Array> {
+    Ok(data.reshape(&[codebooks as i32, vocab as i32, dim as i32])?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mlx_rs::ops::indexing::TryIndexOp;
+
+    #[test]
+    fn converted_flat_codebook_rows_retain_codebook_offsets() -> Result<()> {
+        crate::apple::init()?;
+        let flat = Array::from_slice(&(0..12).map(|v| v as f32).collect::<Vec<_>>(), &[6, 2]);
+        let table = codebook_embeddings(flat, 2, 3, 2)?;
+        assert_eq!(
+            table.try_index((0, 2))?.to_vec_exact::<f32>()?,
+            vec![4.0, 5.0]
+        );
+        assert_eq!(
+            table.try_index((1, 2))?.to_vec_exact::<f32>()?,
+            vec![10.0, 11.0]
+        );
+        Ok(())
     }
 }
 
