@@ -445,6 +445,10 @@ impl Codec {
     pub fn stream(&self) -> Result<DecodeStream> {
         Ok(DecodeStream::default())
     }
+    /// Same as `stream`: no buffers are sized by pass here (the CUDA codec sizes its buffers by it).
+    pub fn stream_for(&self, _pass: usize) -> Result<DecodeStream> {
+        self.stream()
+    }
     pub fn encode(&self, audio: &[f32]) -> Result<Vec<i32>> {
         self.inner
             .lock()
