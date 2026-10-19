@@ -20,8 +20,11 @@ struct Cli {
 enum Experts {
     Auto,
     Q4,
+    #[cfg_attr(feature = "mlx", value(hide = true))]
     Fp8,
+    #[cfg_attr(feature = "mlx", value(hide = true))]
     Fp8Vram,
+    #[cfg_attr(feature = "mlx", value(hide = true))]
     Fp8Ram,
 }
 
@@ -47,16 +50,20 @@ struct Common {
     /// Routed experts. `auto` (default): original FP8 when the checkpoint is found and fits, else int4. `fp8`: original
     /// FP8, as many layers in VRAM as fit and the rest in pinned host RAM (read over PCIe). `fp8-vram`: all in VRAM
     /// (~35 GB card). `fp8-ram`: all in host RAM (~32 GB). `q4`: converted int4 on the GPU, ~8x faster
+    #[cfg_attr(feature = "mlx", arg(help = "Routed experts: auto and q4 use converted int4 weights on Apple Silicon"))]
     #[arg(long, value_enum, default_value_t = Experts::Auto)]
     experts: Experts,
     /// Advanced: how many layers' FP8 experts to put in VRAM (default: as many as fit), the rest in host RAM
+    #[cfg_attr(feature = "mlx", arg(hide = true))]
     #[arg(long)]
     fp8_vram_layers: Option<usize>,
     /// Advanced: VRAM (GB) kept free for the KV caches, scratch, codec and CUDA context when placing FP8 experts
+    #[cfg_attr(feature = "mlx", arg(hide = true))]
     #[arg(long, default_value_t = 3.0)]
     vram_reserve_gb: f64,
     /// The original fishaudio/drama-3 checkpoint for fp8 experts. Default: `models/drama-3` (searched like the
     /// model), then ~/.cache/drama-rs/drama-3
+    #[cfg_attr(feature = "mlx", arg(hide = true))]
     #[arg(long, env = "DRAMA_FP8_MODEL")]
     fp8_model: Option<PathBuf>,
     /// Context length (prompt rows + generated frames)
@@ -78,6 +85,9 @@ struct Common {
 impl Common {
     /// Find the model directories and choose the experts.
     fn resolve(&self) -> Result<drama::download::Resolved> {
+        #[cfg(feature = "mlx")]
+        anyhow::ensure!(matches!(self.experts, Experts::Auto | Experts::Q4) && self.fp8_vram_layers.is_none() && self.fp8_model.is_none(),
+            "Apple Silicon uses converted int4 experts: select --experts q4; FP8 placement is available with the CUDA build");
         let choice = drama::download::Choice {
             want: self.experts.into(),
             vram_layers: self.fp8_vram_layers,
@@ -113,7 +123,7 @@ enum Cmd {
         /// Output WAV file
         #[arg(long)]
         out: Option<PathBuf>,
-        /// Stream the audio to the speakers (PipeWire) while it is generated
+        /// Stream audio to the speakers (ffplay on macOS, PipeWire on Linux)
         #[arg(long)]
         play: bool,
         /// Read lines from stdin and speak each one (keeps the model loaded)

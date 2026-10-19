@@ -48,9 +48,14 @@ fn embed_ui(out: &std::path::Path) {
 
 fn main() {
     let out = PathBuf::from(std::env::var("OUT_DIR").unwrap());
+    embed_ui(&out);
+    if std::env::var_os("CARGO_FEATURE_MLX").is_some() {
+        assert!(std::env::var_os("CARGO_FEATURE_CUDA").is_none(), "select only one backend: --no-default-features --features mlx,cli");
+        assert!(std::env::var("TARGET").unwrap() == "aarch64-apple-darwin", "MLX requires Apple Silicon macOS");
+        return;
+    }
     let cuda = std::env::var("CUDA_PATH").unwrap_or_else(|_| "/opt/cuda".to_string());
     let arch = std::env::var("DRAMA_CUDA_ARCH").unwrap_or_else(|_| "sm_89".to_string());
-    embed_ui(&out);
     println!("cargo:rerun-if-changed=kernels");
     println!("cargo:rerun-if-env-changed=DRAMA_CUDA_ARCH");
     println!("cargo:rerun-if-env-changed=CUDA_PATH");
