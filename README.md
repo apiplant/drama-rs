@@ -1,7 +1,7 @@
 # drama-rs
 
 Fish Audio [Drama 3](https://huggingface.co/fishaudio/drama-3) text-to-speech on a single
-24 GB GPU (RTX 4090), or Apple Silicon using Rust + MLX and unified memory. No PyTorch at runtime.
+24 GB GPU (RTX 4090), from 6 GB with the int4 experts in RAM, or Apple Silicon using Rust + MLX and unified memory. No PyTorch at runtime.
 
 - **Backbone**: Qwen3.5-MoE (35B total / 3B active, 40 layers, gated-DeltaNet linear attention
   + full attention every 4th layer). Routed experts are 4-bit, everything else 8-bit.
@@ -57,7 +57,7 @@ the next kernel's weights into L2 to hide launch gaps.
 
 ## Experts: where they run
 
-The routed experts are 32 of the 35 B parameters, so they decide both quality and speed. Three places to run them:
+The routed experts are 32 of the 35 B parameters, so they decide both quality and speed. Where they run:
 
 | `--experts` | what | GPU memory | host RAM |
 |---|---|---|---|
@@ -65,7 +65,8 @@ The routed experts are 32 of the 35 B parameters, so they decide both quality an
 | `fp8-ram` | original FP8 in pinned host RAM, read over PCIe | ~4.5 GiB | ~32 GB |
 | `fp8-vram` | original FP8 on the GPU | ~36 GiB | small |
 | `fp8` | original FP8, **split by hardware**: as many layers in VRAM as fit, the rest in RAM | up to what's free | the remainder |
-| `auto` (default) | `fp8` if the original checkpoint is found and fits, else `q4` | | |
+| `q4-ram` | converted int4 in pinned host RAM, a VRAM cache of the experts in use | 5 GiB and up (`--vram-gb`) | ~18 GB pinned |
+| `auto` (default) | `fp8` if the original checkpoint is found and fits, else `q4`, or `q4-ram` when int4 does not fit | | |
 
 `fp8` and `auto` look at the free VRAM and RAM at startup and print what they chose, for example
 `original FP8 experts: 23/40 layers in VRAM (18.5 GB), 17 in host RAM (13.7 GB)`. A bigger GPU puts more layers
@@ -105,6 +106,44 @@ Tradeoffs:
 - **Disk:** FP8 needs both directories (60 GB); `q4` only `drama-3-q4` (21 GB).
 - Dense linears are int8 in every mode, so FP8 is closer to the original but not bit-exact. KL is teacher-forced on each
   engine's own sampled frames over one utterance (`tools/check_engine.py --experts fp8|q4 --original models/drama-3`).
+
+### Smaller GPUs: int4 experts in RAM (`q4-ram`)
+
+`--experts q4-ram`, or `auto` when int4 does not fit, with `--vram-gb N` (C ABI: `drama_load_ex`) capping the VRAM the
+engine takes, codec included (0, the default: what is free). When the whole model does not fit, the 18 GB of routed experts stay in page-locked RAM
+and the rest of the limit becomes a VRAM cache of experts shared by all layers. A decode step uses 8 of a layer's
+256 experts: a kernel inside the CUDA graph looks them up and copies the missing ones from RAM over PCIe, so the
+step stays one graph replay. Eviction is GCLOCK (a hit raises a slot's count up to 3, the hand lowers it), all state
+on the GPU. The prefill reads cached experts from their slots and streams the others, 64 at a time. A prompt whose
+voice part (the reference) is the same as the last one starts from the saved state after it, so only the text is
+prefilled. The codec's encoder (it runs once per reference voice) reads its weights from page-locked RAM too, which
+leaves 0.4 GiB more to the cache. The output is bit-identical to the experts-in-VRAM run; a smaller cache only means
+more copies.
+
+Measured on an RTX 4090 (PCIe 4.0 x16) with a cloned voice, the second and third of three sentences (the cache is
+warm, the voice part is reused), `--vram-gb` limiting the engine as a smaller card would:
+
+| `--vram-gb` | expert cache | cache hits | speed | first audio |
+|---|---|---|---|---|
+| 0 (whole model) | – | – | 7.9× real time | 60 ms |
+| 12 | 7.4 GiB | 85% | 4.7× | 220 ms |
+| 8 | 3.4 GiB | 61% | 2.95× | 290 ms |
+| 6 | 1.4 GiB | 39% | 2.25× | 325 ms |
+| 5 | 0.4 GiB | 0% | 1.6× | 365 ms |
+
+The engine needs about 4.8 GiB besides the cache (LM weights 2.8, codec decoder 0.4, buffers 0.7, the codec's working
+memory 0.75), so a 6 GB card, with about 5 GiB free, runs it. With the default limit (0) the engine takes what is free
+less a sixteenth of it (256 MiB to 1 GiB). A cache smaller than one step's 320 experts gets no hits: every expert of
+the step is copied.
+
+The first sentence after loading is slower (about 1.1 s to the first audio), as the empty cache fills.
+
+**RAM: at least 32 GB.** The experts take 18.1 GB of page-locked memory. Windows page-locks only about half of the
+RAM for one process, so by default the engine page-locks at most 45% of the RAM (75% on Linux; `DRAMA_PIN_CAP_GB`
+sets it); the experts past that stay in the mapped model files, and the CPU (AVX2) computes the ones the cache does
+not hold. On a 32 GB machine that is about 3 GB of experts: at an 8 GiB limit 2.2× real time, 335 ms to the first
+audio (the CPU's arithmetic differs from the GPU's, so the audio is not bit-identical, the speech is the same).
+With 16 GB of RAM the experts do not fit at all.
 
 ## Quantization
 
@@ -199,6 +238,9 @@ drama speak --model models/drama-3-q4 --text "Hello there." --play
 drama speak --model models/drama-3-q4 --play \
   --ref-wav voice.wav --ref-text "Exactly what is said in voice.wav." \
   --text "<|speaker:0|> [sighs] Fine. If we miss it, it's on you."
+
+# on a smaller card: at most 8 GiB of VRAM, the routed experts in RAM
+./target/release/drama speak --model models/drama-3-q4 --vram-gb 8 --text "Hello there." --out hello.wav
 
 # keep the model loaded and speak every line typed on stdin
 drama speak --model models/drama-3-q4 --interactive --play

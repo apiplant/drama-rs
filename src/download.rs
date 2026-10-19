@@ -339,7 +339,7 @@ mod tests {
     fn placement(r: &Resolved) -> Option<usize> {
         match r.experts {
             ExpertMode::Fp8 { vram_layers, .. } => Some(vram_layers),
-            ExpertMode::Q4 => None,
+            ExpertMode::Q4 | ExpertMode::Q4Ram { .. } => None,
         }
     }
 
