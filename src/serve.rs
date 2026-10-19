@@ -247,6 +247,7 @@ fn worker(mut tts: Tts, mut voices: HashMap<String, Reference>, defaults: Defaul
                     first_chunk: d.first_chunk,
                     chunk: d.chunk,
                     split: req.split.unwrap_or(d.split),
+                    keep_stalled: true,
                 };
                 let _ = started.send(Ok(()));
                 let sink = |audio: &[f32]| -> Result<()> {

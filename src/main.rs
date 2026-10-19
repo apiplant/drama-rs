@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 use drama::engine::{Engine, SampleParams};
-use drama::{codec, gpu, model, tts};
+use drama::{codec, gpu, tts};
 
 #[derive(Parser)]
 #[command(name = "drama", version, about = "Fish Audio Drama 3 text-to-speech")]
@@ -26,6 +26,8 @@ enum Experts {
     Fp8Vram,
     #[cfg_attr(feature = "mlx", value(hide = true))]
     Fp8Ram,
+    #[cfg_attr(feature = "mlx", value(hide = true))]
+    Q4Ram,
 }
 
 impl From<Experts> for drama::download::Want {
@@ -36,6 +38,7 @@ impl From<Experts> for drama::download::Want {
             Experts::Fp8 => Self::Fp8,
             Experts::Fp8Vram => Self::Fp8Vram,
             Experts::Fp8Ram => Self::Fp8Ram,
+            Experts::Q4Ram => Self::Q4,
         }
     }
 }
@@ -49,7 +52,9 @@ struct Common {
     model: Option<PathBuf>,
     /// Routed experts. `auto` (default): original FP8 when the checkpoint is found and fits, else int4. `fp8`: original
     /// FP8, as many layers in VRAM as fit and the rest in pinned host RAM (read over PCIe). `fp8-vram`: all in VRAM
-    /// (~35 GB card). `fp8-ram`: all in host RAM (~32 GB). `q4`: converted int4 on the GPU, ~8x faster
+    /// (~35 GB card). `fp8-ram`: all in host RAM (~32 GB). `q4`: converted int4 on the GPU, ~8x faster. `q4-ram`: converted
+    /// int4 in page-locked host RAM with a VRAM cache of the experts in use (the card's free VRAM or --vram-gb); `auto`
+    /// takes it when int4 does not fit
     #[cfg_attr(feature = "mlx", arg(help = "Routed experts: auto and q4 use converted int4 weights on Apple Silicon"))]
     #[arg(long, value_enum, default_value_t = Experts::Auto)]
     experts: Experts,
@@ -80,6 +85,13 @@ struct Common {
     top_p: f32,
     #[arg(long, default_value_t = 0)]
     seed: u64,
+    /// Most VRAM to take, in GiB (0 = what is free less 1 GiB). When the whole model does not fit, the routed experts
+    /// stay in RAM and a VRAM cache of the ones in use takes the rest of the limit: less VRAM, slower decoding.
+    #[arg(long, default_value_t = 0.0)]
+    vram_gb: f64,
+    /// Prefill every prompt whole instead of starting from the saved state of its voice part (A/B tests)
+    #[arg(long)]
+    no_voice_reuse: bool,
 }
 
 impl Common {
@@ -100,11 +112,30 @@ impl Common {
     fn params(&self) -> SampleParams {
         SampleParams { temperature: self.temperature, top_k: self.top_k, top_p: self.top_p, pad: 0, seed: self.seed }
     }
+    fn vram_limit(&self) -> usize {
+        (self.vram_gb * (1u64 << 30) as f64) as usize
+    }
+    /// The int4 experts in RAM for `q4-ram`, and for `auto` when int4 does not fit the card or --vram-gb.
+    fn placed(&self, r: &drama::download::Resolved) -> Result<drama::model::ExpertMode> {
+        use drama::model::ExpertMode;
+        match (&r.experts, self.experts) {
+            #[cfg(not(feature = "mlx"))]
+            (ExpertMode::Q4, Experts::Q4Ram) => Ok(ExpertMode::Q4Ram { vram_limit: self.vram_limit() }),
+            #[cfg(not(feature = "mlx"))]
+            (ExpertMode::Q4, Experts::Auto) => tts::Tts::fitting(&r.dir, self.vram_limit()),
+            (e, _) => Ok(e.clone()),
+        }
+    }
     fn engine(&self) -> Result<Engine> {
-        let st = gpu::Stream::new()?;
         let r = self.resolve()?;
-        let model = model::Model::load_with(&r.dir, &st, &r.experts)?;
-        let engine = Engine::new(model, self.max_len, self.chunk)?;
+        let experts = self.placed(&r)?;
+        let engine = if matches!(experts, drama::model::ExpertMode::Q4Ram { .. }) {
+            tts::Tts::load_with(&r.dir, self.max_len, self.chunk, &experts)?.engine
+        } else {
+            let st = gpu::Stream::new()?;
+            let model = drama::model::Model::load_with(&r.dir, &st, &experts)?;
+            Engine::new(model, self.max_len, self.chunk)?
+        };
         let (free, total) = gpu::mem_info()?;
         eprintln!("GPU memory: {:.2} GiB used of {:.2} GiB", (total - free) as f64 / (1u64 << 30) as f64, total as f64 / (1u64 << 30) as f64);
         Ok(engine)
@@ -218,6 +249,14 @@ enum Cmd {
     },
 }
 
+fn print_cache_stats(engine: &Engine) -> Result<()> {
+    if let Some((hits, misses)) = engine.cache_stats()? {
+        let all = (hits + misses).max(1);
+        eprintln!("expert cache: {:.1}% of {all} expert reads hit, {misses} copied from RAM", 100.0 * hits as f64 / all as f64);
+    }
+    Ok(())
+}
+
 fn codec_file(p: Option<PathBuf>) -> Result<PathBuf> {
     match p {
         Some(p) => Ok(p),
@@ -248,7 +287,9 @@ fn main() -> Result<()> {
             }
             let t_load = Instant::now();
             let r = common.resolve()?;
-            let mut tts = tts::Tts::load_with(&r.dir, common.max_len, common.chunk, &r.experts)?;
+            let experts = common.placed(&r)?;
+            let mut tts = tts::Tts::load_with(&r.dir, common.max_len, common.chunk, &experts)?;
+            tts.engine.reuse_voice = !common.no_voice_reuse;
             let (free, total) = gpu::mem_info()?;
             eprintln!(
                 "ready in {:.1}s, GPU memory {:.2} / {:.2} GiB",
@@ -263,7 +304,7 @@ fn main() -> Result<()> {
                 eprintln!("reference {}: {} frames in {:.0} ms", wav.display(), r.codes[0].len(), t1.elapsed().as_secs_f64() * 1e3);
                 refs.push(r);
             }
-            let opts = tts::SpeakOpts { params: common.params(), max_new, first_chunk, chunk: stream_chunk, split: !no_split };
+            let opts = tts::SpeakOpts { params: common.params(), max_new, first_chunk, chunk: stream_chunk, split: !no_split, keep_stalled: true };
             let mut player = if play { Some(tts::Player::new()?) } else { None };
             let lines: Box<dyn Iterator<Item = String>> = match text {
                 Some(t) if !interactive => Box::new(std::iter::once(t)),
@@ -288,6 +329,7 @@ fn main() -> Result<()> {
                     audio_s / spoken.elapsed.as_secs_f64(),
                     spoken.first_audio.map(|d| d.as_secs_f64() * 1e3).unwrap_or(f64::NAN),
                 );
+                print_cache_stats(&tts.engine)?;
                 if let Some(path) = &out {
                     let path = if interactive { path.with_file_name(format!("{}-{n}.wav", path.file_stem().unwrap().to_string_lossy())) } else { path.clone() };
                     codec::write_wav(&path, &spoken.audio)?;
@@ -361,7 +403,7 @@ fn main() -> Result<()> {
             let mut engine = common.engine()?;
             engine.trace_logits = true;
             let prompt = read_i32(&rows)?;
-            engine.prefill(&prompt, common.params())?;
+            engine.prefill(&prompt, common.params(), 0)?;
             let mut f = std::io::BufWriter::new(std::fs::File::create(&out)?);
             for _ in 0..steps {
                 let (frame, trace) = engine.step()?;
@@ -381,7 +423,7 @@ fn main() -> Result<()> {
                 rows[r * width] = 1000 + r as i32;
             }
             let t0 = Instant::now();
-            engine.prefill(&rows, common.params())?;
+            engine.prefill(&rows, common.params(), 0)?;
             eprintln!("prefill {prompt_rows} rows: {:.1} ms", t0.elapsed().as_secs_f64() * 1e3);
             for _ in 0..5 {
                 engine.step()?;
@@ -392,6 +434,7 @@ fn main() -> Result<()> {
             }
             let per = t0.elapsed().as_secs_f64() / steps as f64;
             eprintln!("decode: {:.2} ms/frame, {:.1} frames/s, {:.1}x real time", per * 1e3, 1.0 / per, 1.0 / per / 21.533);
+            print_cache_stats(&engine)?;
         }
     }
     Ok(())
