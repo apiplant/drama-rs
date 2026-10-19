@@ -136,7 +136,8 @@ hf download apiplant/drama-q4 --local-dir models/drama-3-q4
 hf download fishaudio/drama-3 --local-dir models/drama-3      # optional, 39 GB: higher quality, see below
 
 # 2. build (CUDA toolkit in /opt/cuda, or set CUDA_PATH; DRAMA_CUDA_ARCH defaults to sm_89,
-#    a comma-separated list such as sm_86,sm_89 builds for several GPUs)
+#    a comma-separated list such as sm_86,sm_89 builds for several GPUs; no PTX is embedded,
+#    so a GPU not in the list is unsupported. On Windows, build from a VS developer prompt)
 cargo build --release
 ```
 
