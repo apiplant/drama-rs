@@ -1,18 +1,20 @@
 use std::path::PathBuf;
 use std::process::Command;
 
-/// `DRAMA_CUDA_ARCH` is one arch (`sm_89`) or a comma-separated list (`sm_75,sm_80,sm_86,sm_89,sm_120`, for release
-/// builds): machine code for each and no PTX. PTX in a release is JIT-compiled by the driver, and a driver older than
-/// the toolkit refuses it: a card the build has no machine code for is unsupported, never a crash on an old driver.
+/// `DRAMA_CUDA_ARCH` is one arch (`sm_89`) or a comma-separated list (`sm_80,sm_86,sm_89`, for release builds):
+/// machine code for each, plus PTX of the newest so later GPUs can JIT it. `DRAMA_CUDA_NO_PTX=1` leaves the PTX out:
+/// a driver older than the toolkit refuses PTX, so a release then supports exactly the listed cards, never a crash
+/// on an old driver.
 fn gencode(arch: &str) -> Vec<String> {
-    arch.split(',')
-        .map(str::trim)
-        .filter(|a| !a.is_empty())
-        .map(|a| {
-            let n = a.trim_start_matches("sm_");
-            format!("-gencode=arch=compute_{n},code=sm_{n}")
-        })
-        .collect()
+    let ptx = std::env::var_os("DRAMA_CUDA_NO_PTX").is_none_or(|v| v.is_empty() || v == "0");
+    let archs: Vec<&str> = arch.split(',').map(str::trim).filter(|a| !a.is_empty()).collect();
+    let mut args = Vec::new();
+    for (i, a) in archs.iter().enumerate() {
+        let n = a.trim_start_matches("sm_");
+        let code = if ptx && i + 1 == archs.len() { format!("[sm_{n},compute_{n}]") } else { format!("sm_{n}") };
+        args.push(format!("-gencode=arch=compute_{n},code={code}"));
+    }
+    args
 }
 
 /// Writes `$OUT_DIR/ui.rs`: the built web UI (`ui/dist`, from `pnpm build` in `ui/`) as `(path, bytes)` pairs for
@@ -49,12 +51,18 @@ fn embed_ui(out: &std::path::Path) {
 
 fn main() {
     let out = PathBuf::from(std::env::var("OUT_DIR").unwrap());
+    embed_ui(&out);
+    if std::env::var_os("CARGO_FEATURE_MLX").is_some() {
+        assert!(std::env::var_os("CARGO_FEATURE_CUDA").is_none(), "select only one backend: --no-default-features --features mlx,cli");
+        assert!(std::env::var("TARGET").unwrap() == "aarch64-apple-darwin", "MLX requires Apple Silicon macOS");
+        return;
+    }
     let windows = std::env::var("CARGO_CFG_TARGET_OS").unwrap() == "windows";
     let cuda = std::env::var("CUDA_PATH").unwrap_or_else(|_| "/opt/cuda".to_string());
     let arch = std::env::var("DRAMA_CUDA_ARCH").unwrap_or_else(|_| "sm_89".to_string());
-    embed_ui(&out);
     println!("cargo:rerun-if-changed=kernels");
     println!("cargo:rerun-if-env-changed=DRAMA_CUDA_ARCH");
+    println!("cargo:rerun-if-env-changed=DRAMA_CUDA_NO_PTX");
     println!("cargo:rerun-if-env-changed=CUDA_PATH");
 
     if windows {

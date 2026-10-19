@@ -54,6 +54,11 @@ pub struct Player {
 
 impl Player {
     pub fn new() -> Result<Self> {
+        #[cfg(target_os = "macos")]
+        let child = Command::new("ffplay")
+            .args(["-nodisp", "-autoexit", "-loglevel", "error", "-f", "f32le", "-ar", &codec::SAMPLE_RATE.to_string(), "-ac", "1", "-i", "pipe:0"])
+            .stdin(Stdio::piped()).spawn().context("starting ffplay for --play (install ffmpeg)")?;
+        #[cfg(not(target_os = "macos"))]
         let child = Command::new("pw-play")
             .args(["--raw", "--rate", &codec::SAMPLE_RATE.to_string(), "--channels", "1", "--format", "f32", "-"])
             .stdin(Stdio::piped())

@@ -221,6 +221,8 @@ fn available_ram() -> Option<u64> {
 /// either may name the other kind of directory: `--model` may be the original checkpoint, in which case the int4 build
 /// is found (or downloaded) separately for the dense weights.
 pub fn resolve(model: Option<&Path>, original: Option<&Path>, choice: Choice) -> Result<Resolved> {
+    #[cfg(feature = "mlx")]
+    let choice = if choice.want == Want::Auto { Choice { want: Want::Q4, ..choice } } else { choice };
     let model_is_original = model.is_some_and(is_original_dir);
     let q4 = match model {
         Some(p) if !model_is_original => p.to_path_buf(),

@@ -1,12 +1,41 @@
 # drama-rs
 
 Fish Audio [Drama 3](https://huggingface.co/fishaudio/drama-3) text-to-speech on a single
-24 GB GPU (RTX 4090), in Rust + CUDA. No PyTorch at runtime.
+24 GB GPU (RTX 4090), or Apple Silicon using Rust + MLX and unified memory. No PyTorch at runtime.
 
 - **Backbone**: Qwen3.5-MoE (35B total / 3B active, 40 layers, gated-DeltaNet linear attention
   + full attention every 4th layer). Routed experts are 4-bit, everything else 8-bit.
 - **Codebook tower**: 13 transformer layers that predict codebooks 1–9 of every frame.
 - **Codec**: the Fish modded-DAC encoder (voice cloning) and decoder, streaming and exact.
+
+## Apple Silicon (MLX)
+
+On an M-series Mac with macOS 15+, Rust 1.97+, CMake, Xcode command-line tools and the Metal toolchain:
+
+```sh
+(cd ui && pnpm install && pnpm build) # embed the web studio
+cargo build --release --no-default-features --features mlx,cli
+# Uses the existing drama-rs-v1 converted checkpoint; the usual model download/cache also works.
+target/release/drama speak --model /path/to/drama-3-q4 --experts q4 --text "Hello from my Mac." --out hello.wav
+```
+
+The MLX backend runs the backbone, gated DeltaNet, routed int4 experts, audio tower and streaming codec on the
+GPU. Voice-reference encoding uses the same converted codec. Q4/Q8 values are mapped losslessly to MLX's packed
+affine format; weights remain quantized rather than expanding the 35B model to floating point. CPU and GPU use
+the same memory pool, without pinned PCIe staging. Prefill groups rows by routed expert and bounds recurrent
+computation graphs; decoding retains KV and convolution histories across calls.
+
+Use `--no-default-features --features mlx,cli` for the CLI, or `mlx` alone for the library. CUDA remains the
+default. Select exactly one backend. On MLX, `--experts auto` selects `q4`; original FP8 experts and their
+RAM/VRAM placement controls remain CUDA-only. A Mac with at least 32 GB unified memory is the practical starting
+point for the roughly 21 GiB checkpoint plus caches, codec and macOS. Larger contexts need more headroom.
+`DRAMA_UNIFIED_MEMORY_GB` optionally sets MLX's allocator budget in GiB (default 80% of physical memory), without
+changing system GPU limits. Release archives bundle `mlx.metallib` beside `drama`; Homebrew places it in
+`share/drama-rs`. Keep that library when copying an installed binary. `--play` uses `ffplay` from FFmpeg on macOS.
+
+The RTX 4090 numbers below are CUDA measurements. Mac performance and full checkpoint output parity have not
+been measured; `cargo test --no-default-features --features mlx,cli --lib` checks packed quantization and
+streaming state on Apple Silicon without downloading model weights.
 
 ## Footprint and speed (RTX 4090, int4 experts)
 
@@ -90,11 +119,11 @@ Tradeoffs:
 
 ## Install
 
-Prebuilt for Linux x86_64 (CUDA 12 runtime, Ampere or newer) on the
+Release packaging supports Linux x86_64 (CUDA 12 runtime, Ampere or newer) and Apple Silicon (macOS 15+) on the
 [releases page](https://github.com/apiplant/drama-rs/releases), and packaged:
 
 ```bash
-brew install apiplant/tap/drama-rs     # Homebrew on Linux
+brew install apiplant/tap/drama-rs     # Homebrew on Linux or Apple Silicon
 sudo apt install drama-rs              # apt.apiplant.com
 sudo pacman -S drama-rs                # apiplant.github.io/pacman
 cargo install drama-rs                 # from crates.io (needs nvcc; DRAMA_CUDA_ARCH, default sm_89)
@@ -136,8 +165,8 @@ hf download apiplant/drama-q4 --local-dir models/drama-3-q4
 hf download fishaudio/drama-3 --local-dir models/drama-3      # optional, 39 GB: higher quality, see below
 
 # 2. build (CUDA toolkit in /opt/cuda, or set CUDA_PATH; DRAMA_CUDA_ARCH defaults to sm_89,
-#    a comma-separated list such as sm_86,sm_89 builds for several GPUs; no PTX is embedded,
-#    so a GPU not in the list is unsupported. On Windows, build from a VS developer prompt)
+#    a comma-separated list such as sm_86,sm_89 builds for several GPUs; DRAMA_CUDA_NO_PTX=1 omits
+#    the PTX, so only the listed GPUs run. On Windows, build from a VS developer prompt)
 cargo build --release
 ```
 
