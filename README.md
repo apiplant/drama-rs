@@ -83,9 +83,9 @@ Measured on an RTX 4090 (24 GB, PCIe 4.0 x16), decoding one sentence:
 
 | | `q4` | `fp8` (auto: 23/40 layers in VRAM) | `--fp8-vram-layers 10` | `fp8-ram` |
 |---|---|---|---|---|
-| decode speed | 8.9x real time | 2.0x | 1.1x | 1.0x |
+| decode speed | 8.9x real time | 2.2x | 1.4x | 1.1x |
 | time to first audio | ~150 ms | ~490 ms | ~690 ms | ~1 s |
-| GPU memory | ~21 GiB | ~21.8 GiB | ~12 GiB | ~4.5 GiB |
+| GPU memory | ~21 GiB | ~21 GiB | ~11 GiB | ~4 GiB |
 | host RAM | small | ~14 GB pinned | ~24 GB | ~32 GB |
 | KL vs original FP8 (main / heads) | 0.015 / 0.007-0.0085 | 0.010 / ~0.006 | same as `fp8` | same as `fp8` |
 
