@@ -88,4 +88,8 @@ pub enum ExpertMode {
     /// layers' experts are uploaded to the GPU, the rest stay in pinned host RAM and are read by the kernels over
     /// PCIe. Everything else stays as converted.
     Fp8 { dir: PathBuf, vram_layers: usize },
+    /// The converted int4 experts in page-locked host RAM, for a card the model does not fit: decoding keeps the
+    /// experts in use in a VRAM cache that takes what `vram_limit` bytes leave (0: the free VRAM less a margin). The
+    /// output is the same as `Q4`; a larger cache only makes it faster.
+    Q4Ram { vram_limit: usize },
 }
