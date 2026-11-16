@@ -11,12 +11,17 @@ use std::ffi::c_void;
 use anyhow::{bail, Result};
 
 use crate::ffi;
-use crate::gpu::{launched, Cublas, DevBuf, Graph, Pinned, Stream};
-use crate::model::{Dense, Experts, Mixer, Model, Q8};
+use crate::cpu_moe::{CpuMoe, Io, LayerExperts};
+use crate::gpu::{check, launched, mem_info, Cublas, DevBuf, Graph, Pinned, Stream};
+use crate::model::{Dense, Experts, Layer, Mixer, Model, Placement, Q8};
 
 pub const RAS_WINDOW: usize = 16;
 const ROUTER_PREFETCH: bool = false;
 const GEMV_PREFETCH: bool = true;
+/// Routed experts a prefill copies to the GPU at a time when they live in RAM.
+const PF_EXPERTS: usize = 64;
+/// Smallest expert cache worth running: below it nearly every expert read is a miss.
+const MIN_SLOTS: usize = 64;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -100,6 +105,62 @@ struct PrefillBufs {
     wbuf: DevBuf,
 }
 
+/// The reference count a cache hit raises an expert's slot to (GCLOCK): experts used often outlive ones used once.
+const MAX_REF: u32 = 3;
+
+/// Host-function context of the CPU experts: one per layer, alive as long as the graph.
+struct CpuCall {
+    cpu: *const CpuMoe,
+    layer: usize,
+    io: *mut Io,
+}
+
+unsafe extern "C" fn cpu_submit(user: *mut c_void) {
+    let c = &*(user as *const CpuCall);
+    (*c.cpu).submit(c.layer, c.io);
+}
+
+unsafe extern "C" fn cpu_wait(user: *mut c_void) {
+    let c = &*(user as *const CpuCall);
+    (*c.cpu).wait();
+}
+
+/// VRAM slots for routed experts that live in RAM, shared by all layers (see `dr_expert_slots`). A slot holds one
+/// expert's four parts at the same offsets as an expert bank, so the decode kernels read slots like experts.
+struct ExpertCache {
+    slots: usize,
+    /// gate_up q, gate_up sm, down q, down sm: [slots][bytes]
+    banks: [DevBuf; 4],
+    bytes: [usize; 4],
+    map: DevBuf,
+    owner: DevBuf,
+    refb: DevBuf,
+    tag: DevBuf,
+    state: DevBuf,
+    sidx: DevBuf,
+    /// The prefill's experts that are not in the cache, PF_EXPERTS at a time.
+    stage: [DevBuf; 4],
+    /// [num_experts] i32: where a prefill pass reads each expert (see `pf_expert` in drama.cu).
+    pf_where: DevBuf,
+    /// The first prefill fills the empty cache with the experts its prompt used most.
+    seeded: bool,
+    fill: DevBuf,
+    /// The GPU pass's experts and weights with the CPU's experts masked out (on the zeroed slot `slots`).
+    sidx2: DevBuf,
+    wts2: DevBuf,
+}
+
+/// The engine state after a prompt's voice part (everything before the text being said): the full-attention and
+/// tower KV caches up to that row, and the DeltaNet conv and recurrent states at it. A later prompt with the same
+/// voice part (and the same first text row, which the tower's last voice row reads) starts from here.
+struct VoiceSnap {
+    key: Option<u64>,
+    kv: Vec<Option<(DevBuf, DevBuf)>>,
+    conv: Vec<Option<DevBuf>>,
+    rec: Vec<Option<DevBuf>>,
+    tkv: Vec<(DevBuf, DevBuf)>,
+}
+
 pub struct Engine {
     pub model: Model,
     st: Stream,
@@ -122,9 +183,33 @@ pub struct Engine {
     dec: DecodeBufs,
     pre: PrefillBufs,
     graph: Option<Graph>,
+    cache: Option<ExpertCache>,
+    /// Owns the CPU workers `cpu_calls` point at.
+    _cpu: Option<Box<CpuMoe>>,
+    cpu_calls: Vec<Box<CpuCall>>,
+    io: Option<Pinned<Io>>,
+    cpu_out: Option<DevBuf>,
+    _norms: Vec<Vec<f32>>,
+    voice: VoiceSnap,
+    /// Prompts with a known voice part start from its saved state (see `VoiceSnap`).
+    pub reuse_voice: bool,
     frame_host: Pinned<i32>,
     pub trace_logits: bool,
+    /// Set from any thread to end the running `generate` at its next frame with [`Cancelled`].
+    pub stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
+
+/// The error `generate` ends with when [`Engine::stop`] was set.
+#[derive(Debug)]
+pub struct Cancelled;
+
+impl std::fmt::Display for Cancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("generation cancelled")
+    }
+}
+
+impl std::error::Error for Cancelled {}
 
 pub struct StepTrace {
     pub main_logits: Vec<f32>,
@@ -163,8 +248,94 @@ fn i(b: &DevBuf) -> *mut i32 {
     b.ptr::<i32>()
 }
 
+impl ExpertCache {
+    /// Takes the VRAM free now less `keep_free`.
+    fn new(model: &Model, keep_free: usize, st: &Stream) -> Result<Self> {
+        let tc = &model.cfg.text_config;
+        let (gu0, dn0) = model.layers[0].q4_in_ram();
+        let (gq, gs) = gu0.expert_bytes();
+        let (dq, ds) = dn0.expert_bytes();
+        let bytes = [gq, gs, dq, ds];
+        let per: usize = bytes.iter().sum();
+        let stage = [
+            DevBuf::alloc(PF_EXPERTS * gq)?,
+            DevBuf::alloc(PF_EXPERTS * gs)?,
+            DevBuf::alloc(PF_EXPERTS * dq)?,
+            DevBuf::alloc(PF_EXPERTS * ds)?,
+        ];
+        let total = tc.num_hidden_layers * tc.num_experts;
+        let (free, _) = mem_info()?;
+        // one more slot stays zeroed: the GPU pass points the experts the CPU computes at it
+        let slots = (free.saturating_sub(keep_free) / per).saturating_sub(1).min(total);
+        if slots < MIN_SLOTS {
+            bail!(
+                "not enough VRAM for the expert cache: {:.2} GiB free, {:.2} GiB to keep free, at least {:.2} GiB needed",
+                free as f64 / (1u64 << 30) as f64,
+                keep_free as f64 / (1u64 << 30) as f64,
+                (keep_free + MIN_SLOTS * per) as f64 / (1u64 << 30) as f64
+            );
+        }
+        let banks = [
+            DevBuf::alloc((slots + 1) * gq)?,
+            DevBuf::alloc((slots + 1) * gs)?,
+            DevBuf::alloc((slots + 1) * dq)?,
+            DevBuf::alloc((slots + 1) * ds)?,
+        ];
+        for (b, &n) in banks.iter().zip(&bytes) {
+            check(unsafe { ffi::dr_memset(b.at::<u8>(slots * n) as *mut c_void, 0, n, st.raw) }, "memset")?;
+        }
+        let topk = tc.num_experts_per_tok;
+        let cache = Self {
+            slots,
+            banks,
+            bytes,
+            map: DevBuf::alloc(total * I32)?,
+            owner: DevBuf::alloc(slots * I32)?,
+            refb: DevBuf::zeros(slots * 4, st)?,
+            tag: DevBuf::zeros(slots * 4, st)?,
+            state: DevBuf::zeros(8 * 4, st)?,
+            sidx: DevBuf::alloc(topk * I32)?,
+            stage,
+            pf_where: DevBuf::alloc(tc.num_experts * I32)?,
+            seeded: false,
+            fill: DevBuf::alloc(topk * I32)?,
+            sidx2: DevBuf::alloc(topk * I32)?,
+            wts2: DevBuf::alloc(topk * F32)?,
+        };
+        cache.map.fill_bytes(0xff, st)?;
+        cache.owner.fill_bytes(0xff, st)?;
+        eprintln!(
+            "expert cache: {slots} of {total} experts ({:.2} GiB of VRAM)",
+            (slots * per) as f64 / (1u64 << 30) as f64
+        );
+        Ok(cache)
+    }
+}
+
+/// Some of the layer's experts stay in the mapped file: the GPU cannot read them, the CPU computes their misses.
+fn layer_mapped(layer: &Layer) -> bool {
+    layer.q4().is_some_and(|(gu, dn)| [&gu.q, &gu.sm, &dn.q, &dn.sm].iter().any(|b| b.mapped()))
+}
+
+/// Bank part `p` of an expert bank as (device address for kernels, host address for copies).
+fn part(layer: &Layer, p: usize) -> (*const u8, Option<*const u8>) {
+    let (gu, dn) = layer.q4_in_ram();
+    let bank = match p {
+        0 => &gu.q,
+        1 => &gu.sm,
+        2 => &dn.q,
+        _ => &dn.sm,
+    };
+    (bank.dev(), bank.host())
+}
+
 impl Engine {
     pub fn new(model: Model, max_len: usize, chunk: usize) -> Result<Self> {
+        Self::with_cache(model, max_len, chunk, 0)
+    }
+
+    /// `keep_free`: with the experts in RAM, the expert cache takes the VRAM free after the engine's buffers less this.
+    pub fn with_cache(model: Model, max_len: usize, chunk: usize, keep_free: usize) -> Result<Self> {
         let st = Stream::new()?;
         let blas = Cublas::new(&st)?;
         launched(unsafe { ffi::dr_sample_init() }, "sample init")?;
@@ -304,6 +475,45 @@ impl Engine {
             wbuf: DevBuf::alloc(wmax * BF16)?,
         };
 
+        let voice = VoiceSnap {
+            key: None,
+            kv: kv.iter().map(|k| k.as_ref().map(|(a, b)| Ok::<_, anyhow::Error>((DevBuf::alloc(a.bytes())?, DevBuf::alloc(b.bytes())?))).transpose()).collect::<Result<_>>()?,
+            conv: conv_state.iter().map(|c| c.as_ref().map(|c| DevBuf::alloc(c.bytes())).transpose()).collect::<Result<_>>()?,
+            rec: rec_state.iter().map(|c| c.as_ref().map(|c| DevBuf::alloc(c.bytes())).transpose()).collect::<Result<_>>()?,
+            tkv: tkv.iter().map(|(a, b)| Ok((DevBuf::alloc(a.bytes())?, DevBuf::alloc(b.bytes())?))).collect::<Result<_>>()?,
+        };
+        let cache = if model.placement == Placement::Ram { Some(ExpertCache::new(&model, keep_free, &st)?) } else { None };
+        let any_mapped = model.layers.iter().any(layer_mapped);
+        let cpu_on = cache.is_some() && any_mapped;
+        let mut norms = Vec::new();
+        let mut cpu = None;
+        let mut io = None;
+        let mut cpu_out = None;
+        if cpu_on {
+            let mut layers = Vec::new();
+            for l in &model.layers {
+                norms.push(l.post_norm.buf.download::<f32>(d, &st)?);
+                let host = |b: &crate::model::Bank| b.host().expect("experts in RAM");
+                let (gu, dn) = l.q4_in_ram();
+                layers.push(LayerExperts {
+                    gu_q: host(&gu.q),
+                    gu_sm: host(&gu.sm) as *const u16,
+                    d_q: host(&dn.q),
+                    d_sm: host(&dn.sm) as *const u16,
+                    norm: norms.last().unwrap().as_ptr(),
+                });
+            }
+            cpu = Some(Box::new(CpuMoe::new(layers, tc.rms_norm_eps)));
+            io = Some(Pinned::<Io>::new(1)?);
+            cpu_out = Some(DevBuf::alloc(d * F32)?);
+        }
+        let cpu_calls: Vec<Box<CpuCall>> = match (&cpu, &io) {
+            (Some(c), Some(io)) => (0..tc.num_hidden_layers)
+                .map(|li| Box::new(CpuCall { cpu: &**c as *const CpuMoe, layer: li, io: io.ptr() }))
+                .collect(),
+            _ => Vec::new(),
+        };
+
         let mut engine = Self {
             st,
             blas,
@@ -325,8 +535,17 @@ impl Engine {
             dec,
             pre,
             graph: None,
+            cache,
+            _cpu: cpu,
+            cpu_calls,
+            io,
+            cpu_out,
+            _norms: norms,
+            voice,
+            reuse_voice: true,
             frame_host: Pinned::new(width)?,
             trace_logits: false,
+            stop: Default::default(),
             model,
         };
         engine.st.sync()?;
@@ -357,8 +576,39 @@ impl Engine {
 
     // ------------------------------------------------------------------------------ prefill
 
-    /// Run the prompt rows ([rows, width] row-major) and leave the engine ready to decode.
-    pub fn prefill(&mut self, frames: &[i32], params: SampleParams) -> Result<()> {
+    /// Copies rows [0, rows) of the KV caches and the whole DeltaNet states between the live engine and the voice
+    /// snapshot (`save`: live to snapshot).
+    fn voice_copy(&self, rows: usize, save: bool) -> Result<()> {
+        let cfg = &self.model.cfg;
+        let kv_row = cfg.text_config.num_key_value_heads * cfg.text_config.head_dim * BF16;
+        let tkv_row = cfg.audio_decoder_config.n_local_heads * cfg.audio_decoder_config.head_dim * BF16;
+        let s = self.s();
+        let copy = |live: &DevBuf, snap: &DevBuf, bytes: usize| {
+            let (dst, src) = if save { (snap, live) } else { (live, snap) };
+            check(unsafe { ffi::dr_d2d(dst.ptr::<c_void>(), src.ptr::<c_void>() as *const c_void, bytes, s) }, "voice state copy")
+        };
+        for (live, snap) in self.kv.iter().zip(&self.voice.kv) {
+            if let (Some((lk, lv)), Some((sk, sv))) = (live, snap) {
+                copy(lk, sk, rows * kv_row)?;
+                copy(lv, sv, rows * kv_row)?;
+            }
+        }
+        for (live, snap) in self.conv_state.iter().zip(&self.voice.conv).chain(self.rec_state.iter().zip(&self.voice.rec)) {
+            if let (Some(l), Some(sn)) = (live, snap) {
+                copy(l, sn, l.bytes())?;
+            }
+        }
+        for ((lk, lv), (sk, sv)) in self.tkv.iter().zip(&self.voice.tkv) {
+            copy(lk, sk, rows * tkv_row)?;
+            copy(lv, sv, rows * tkv_row)?;
+        }
+        Ok(())
+    }
+
+    /// Run the prompt rows ([rows, width] row-major) and leave the engine ready to decode. `voice_rows`: rows of the
+    /// prompt's voice part (0: none); the prefill cuts its chunks there, saves the state at that row and, with
+    /// `reuse_voice`, starts a prompt whose voice part is the saved one from that state.
+    pub fn prefill(&mut self, frames: &[i32], params: SampleParams, voice_rows: usize) -> Result<()> {
         let cfg = self.model.cfg.clone();
         let width = cfg.frame_width();
         let rows = frames.len() / width;
@@ -372,17 +622,37 @@ impl Engine {
         for s in self.conv_state.iter().chain(self.rec_state.iter()).flatten() {
             s.zero(&self.st)?;
         }
+        let voice_rows = if voice_rows > 0 && voice_rows < rows - 1 { voice_rows } else { 0 };
+        let key = (voice_rows > 0).then(|| {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            frames[..(voice_rows + 1) * width].hash(&mut h);
+            h.finish()
+        });
         let d_frames = DevBuf::from_slice(frames, &self.st)?;
         let mut start = 0;
+        if self.reuse_voice && key.is_some() && key == self.voice.key {
+            self.voice_copy(voice_rows, false)?;
+            start = voice_rows;
+        }
+        let mut last_start = start;
         while start < rows {
-            let n = (rows - start).min(self.chunk);
-            self.prefill_chunk(&d_frames, frames, start, n, rows)?;
-            start += n;
+            let end = if start < voice_rows { voice_rows.min(start + self.chunk) } else { rows.min(start + self.chunk) };
+            self.prefill_chunk(&d_frames, frames, start, end - start, rows)?;
+            last_start = start;
+            start = end;
+            if start == voice_rows && key.is_some() && key != self.voice.key {
+                self.voice_copy(voice_rows, true)?;
+                self.voice.key = key;
+            }
+        }
+        if let Some(c) = self.cache.as_mut() {
+            c.seeded = true;
         }
 
         // Decode state: hidden of the last row, its frame, the RAS window.
         let d = cfg.text_config.hidden_size;
-        let last = (rows - 1 - (rows - 1) / self.chunk * self.chunk) * d;
+        let last = (rows - 1 - last_start) * d;
         unsafe {
             ffi::dr_d2d(f(&self.dec.x) as *mut c_void, self.pre.x.at::<f32>(last) as *const c_void, d * F32, self.s());
         }
@@ -497,7 +767,7 @@ impl Engine {
             }
             // MoE
             self.rmsnorm(f(&p.x), &layer.post_norm, std::ptr::null_mut(), h(&p.hn_b), n, eps)?;
-            self.moe_prefill(layer, n)?;
+            self.moe_prefill(li, layer, n, start == 0)?;
         }
         self.rmsnorm(f(&p.x), &self.model.final_norm, f(&p.h_all), std::ptr::null_mut(), n, eps)?;
 
@@ -541,7 +811,7 @@ impl Engine {
         self.gemm_q8(h(&p.o_b), o_w, resid, n, 1.0)
     }
 
-    fn moe_prefill(&self, layer: &crate::model::Layer, n: usize) -> Result<()> {
+    fn moe_prefill(&self, li: usize, layer: &Layer, n: usize, first_chunk: bool) -> Result<()> {
         let tc = &self.model.cfg.text_config;
         let p = &self.pre;
         let s = self.s();
@@ -579,28 +849,137 @@ impl Engine {
             },
             "moe_permute",
         )?;
-        launched(
-            unsafe {
-                match &layer.experts {
-                    Experts::Q4 { gate_up, down } => {
-                        let (gq, gs) = gate_up.expert(0);
-                        let (dq, ds) = down.expert(0);
-                        ffi::dr_moe_prefill(gq, gs, dq, ds, h(&p.xp), i(&p.offsets), i(&p.counts), h(&p.ap), f(&p.yp), e as i32, d as i32, mi as i32, s)
+        if let Some(c) = &self.cache {
+            self.moe_prefill_ram(c, li, layer, &counts, first_chunk && !c.seeded)?;
+        } else {
+            launched(
+                unsafe {
+                    match &layer.experts {
+                        Experts::Q4 { gate_up, down } => {
+                            let (gq, gs) = gate_up.expert(0);
+                            let (dq, ds) = down.expert(0);
+                            ffi::dr_moe_prefill(gq, gs, dq, ds, h(&p.xp), i(&p.offsets), i(&p.counts), h(&p.ap), f(&p.yp), e as i32, d as i32, mi as i32, s)
+                        }
+                        Experts::Fp8(x) => ffi::dr_moe_prefill_fp8(
+                            x.gu_w.ptr(), x.gu_s.ptr(), x.d_w.ptr(), x.d_s.ptr(), h(&p.xp), i(&p.offsets), i(&p.counts), h(&p.ap), f(&p.yp), e as i32, d as i32,
+                            mi as i32, s,
+                        ),
                     }
-                    Experts::Fp8(x) => ffi::dr_moe_prefill_fp8(
-                        x.gu_w.ptr(), x.gu_s.ptr(), x.d_w.ptr(), x.d_s.ptr(), h(&p.xp), i(&p.offsets), i(&p.counts), h(&p.ap), f(&p.yp), e as i32, d as i32,
-                        mi as i32, s,
-                    ),
-                }
-            },
-            "moe_prefill",
-        )?;
+                },
+                "moe_prefill",
+            )?;
+        }
         launched(
             unsafe {
                 ffi::dr_moe_combine(f(&p.x), f(&p.yp), i(&p.slot_of), f(&p.wts), f(&p.sgate), f(&p.sh_out), n as i32, topk as i32, d as i32, s)
             },
             "moe_combine",
         )
+    }
+
+    /// The grouped expert pass with the experts in RAM. One pass reads the experts that are in the VRAM cache from their
+    /// slots; the others go to the stage over PCIe, PF_EXPERTS at a time, each run of consecutive experts in one copy.
+    /// `seed`: also give the layer's most used experts of this prompt an equal share of the (empty) cache.
+    fn moe_prefill_ram(&self, c: &ExpertCache, li: usize, layer: &Layer, counts: &[i32], seed: bool) -> Result<()> {
+        let tc = &self.model.cfg.text_config;
+        let p = &self.pre;
+        let s = self.s();
+        let e = tc.num_experts;
+        let (d, mi) = (tc.hidden_size, tc.moe_intermediate_size);
+        let mut map: Vec<i32> = c.map.download_at(li * e * I32, e, &self.st)?;
+        let run = |where_: &[i32]| -> Result<()> {
+            c.pf_where.upload_at(0, where_, &self.st)?;
+            launched(
+                unsafe {
+                    ffi::dr_moe_prefill_where(
+                        c.banks[0].ptr::<u8>(),
+                        c.banks[1].ptr::<u16>(),
+                        c.banks[2].ptr::<u8>(),
+                        c.banks[3].ptr::<u16>(),
+                        c.stage[0].ptr::<u8>(),
+                        c.stage[1].ptr::<u16>(),
+                        c.stage[2].ptr::<u8>(),
+                        c.stage[3].ptr::<u16>(),
+                        i(&c.pf_where),
+                        h(&p.xp),
+                        i(&p.offsets),
+                        i(&p.counts),
+                        h(&p.ap),
+                        f(&p.yp),
+                        e as i32,
+                        d as i32,
+                        mi as i32,
+                        s,
+                    )
+                },
+                "moe_prefill",
+            )
+        };
+
+        let used = |x: usize| counts[x] > 0;
+        if (0..e).any(|x| used(x) && map[x] >= 0) {
+            let where_: Vec<i32> = (0..e).map(|x| if used(x) && map[x] >= 0 { map[x] } else { -1 }).collect();
+            run(&where_)?;
+        }
+
+        let missing: Vec<usize> = (0..e).filter(|&x| used(x) && map[x] < 0).collect();
+        let share = c.slots / tc.num_hidden_layers;
+        let mut seeds: Vec<(usize, usize)> = Vec::new();
+        if seed {
+            let mut by_use = missing.clone();
+            by_use.sort_by_key(|&x| std::cmp::Reverse(counts[x]));
+            seeds = by_use.into_iter().take(share).enumerate().map(|(r, x)| (x, li * share + r)).collect();
+        }
+        for batch in missing.chunks(PF_EXPERTS) {
+            let mut k = 0;
+            while k < batch.len() {
+                let mut n = 1;
+                while k + n < batch.len() && batch[k + n] == batch[k] + n {
+                    n += 1;
+                }
+                for (q, &b) in c.bytes.iter().enumerate() {
+                    let host = part(layer, q).1.expect("experts in RAM");
+                    check(
+                        unsafe { ffi::dr_h2d(c.stage[q].at::<u8>(k * b) as *mut c_void, host.add(batch[k] * b) as *const c_void, n * b, s) },
+                        "expert copy",
+                    )?;
+                }
+                k += n;
+            }
+            let mut where_ = vec![-1i32; e];
+            for (k, &x) in batch.iter().enumerate() {
+                where_[x] = -(k as i32) - 2;
+            }
+            run(&where_)?;
+            for &(x, slot) in seeds.iter() {
+                if let Some(k) = batch.iter().position(|&y| y == x) {
+                    for (q, &b) in c.bytes.iter().enumerate() {
+                        check(
+                            unsafe { ffi::dr_d2d(c.banks[q].at::<u8>(slot * b) as *mut c_void, c.stage[q].at::<u8>(k * b) as *const c_void, b, s) },
+                            "expert copy",
+                        )?;
+                    }
+                }
+            }
+        }
+
+        if !seeds.is_empty() {
+            let mut owner = Vec::with_capacity(seeds.len());
+            for &(x, slot) in &seeds {
+                map[x] = slot as i32;
+                owner.push((li * e + x) as i32);
+            }
+            c.map.upload_at(li * e * I32, &map, &self.st)?;
+            c.owner.upload_at(seeds[0].1 * I32, &owner, &self.st)?;
+        }
+        Ok(())
+    }
+
+    /// Expert reads that found their expert in the VRAM cache, and those that copied it from RAM, since loading.
+    pub fn cache_stats(&self) -> Result<Option<(u64, u64)>> {
+        let Some(c) = &self.cache else { return Ok(None) };
+        let v: Vec<u64> = c.state.download_at(8, 2, &self.st)?;
+        Ok(Some((v[0], v[1])))
     }
 
     /// Teacher-forced tower over prompt rows [start, start + m): each row's labels are the
@@ -945,15 +1324,26 @@ impl Engine {
             }
             let e = tc.num_experts;
             let topk = tc.num_experts_per_tok;
-            // Expert weights as raw (q, scale) pointers; the router warms L2 only for the int4 layout.
-            let (gq, gs, dq, ds, pf_sizes, fp8) = match &layer.experts {
-                Experts::Q4 { gate_up: gu, down: dn } => {
+            let cache = self.cache.as_ref();
+            // Expert weights as raw (q, scale) pointers; the router warms L2 only for the int4 layout on the GPU. With the
+            // int4 experts in RAM the kernels read the cache slots, addressed by slot ids.
+            let (gq, gs, dq, ds, pf_sizes, fp8) = match (&layer.experts, cache) {
+                (Experts::Q4 { gate_up: gu, down: dn }, Some(c)) => (
+                    c.banks[0].ptr::<u8>() as *const u8,
+                    c.banks[1].ptr::<u8>() as *const u8,
+                    c.banks[2].ptr::<u8>() as *const u8,
+                    c.banks[3].ptr::<u8>() as *const u8,
+                    [gu.n * gu.k / 2, gu.n * (gu.k / 64) * 4, dn.n * dn.k / 2, dn.n * (dn.k / 64) * 4],
+                    false,
+                ),
+                (Experts::Q4 { gate_up: gu, down: dn }, None) => {
                     let (gq, gs) = gu.expert(0);
                     let (dq, ds) = dn.expert(0);
                     (gq, gs as *const u8, dq, ds as *const u8, [gu.n * gu.k / 2, gu.n * (gu.k / 64) * 4, dn.n * dn.k / 2, dn.n * (dn.k / 64) * 4], false)
                 }
-                Experts::Fp8(x) => (x.gu_w.ptr() as *const u8, x.gu_s.ptr() as *const u8, x.d_w.ptr() as *const u8, x.d_s.ptr() as *const u8, [0; 4], true),
+                (Experts::Fp8(x), _) => (x.gu_w.ptr() as *const u8, x.gu_s.ptr() as *const u8, x.d_w.ptr() as *const u8, x.d_s.ptr() as *const u8, [0; 4], true),
             };
+            let moe_idx = cache.map_or(i(&b.idx), |c| i(&c.sidx));
             let router = &layer.router;
             let post = &layer.post_norm;
             ops.push(Op::weights(router.bf16() as *const u8, (e + 1) * d * 2, move |_, _| {
@@ -973,7 +1363,7 @@ impl Engine {
                             f(&b.wts),
                             f(&b.sgate),
                             b.counter.ptr::<u32>(),
-                            if ROUTER_PREFETCH && !fp8 { gq as *const std::ffi::c_char } else { std::ptr::null() },
+                            if ROUTER_PREFETCH && !fp8 && cache.is_none() { gq as *const std::ffi::c_char } else { std::ptr::null() },
                             gs as *const std::ffi::c_char,
                             dq as *const std::ffi::c_char,
                             ds as *const std::ffi::c_char,
@@ -990,55 +1380,75 @@ impl Engine {
             let (sgq, sgs) = layer.shared_gate_up.rows(0);
             let (sdq, sds) = layer.shared_down.rows(0);
             let mi = tc.moe_intermediate_size;
-            ops.push(Op::plain(move |pf, pfb| {
+            let moe = move |idx: *const i32, wts: *const f32, pf: *const std::ffi::c_char, pfb: usize| {
                 launched(
                     unsafe {
                         if fp8 {
-                            ffi::dr_moe_decode_fp8(gq, gs as *const f32, dq, ds as *const f32, sgq,
-                            sgs,
-                            sdq,
-                            sds,
-                            f(&b.x),
-                            i(&b.idx),
-                            f(&b.wts),
-                            f(&b.sgate),
-                            f(&b.x),
-                            f(&b.act),
-                            f(&b.x),
-                            d as i32,
-                            mi as i32,
-                            topk as i32,
-                            post.f32(),
-                            eps,
-                            pf,
-                            pfb,
-                            s,
-                        )
+                            ffi::dr_moe_decode_fp8(
+                                gq, gs as *const f32, dq, ds as *const f32, sgq, sgs, sdq, sds, f(&b.x), idx, wts, f(&b.sgate), f(&b.x), f(&b.act), f(&b.x),
+                                d as i32, mi as i32, topk as i32, post.f32(), eps, pf, pfb, s,
+                            )
                         } else {
-                            ffi::dr_moe_decode(gq, gs as *const u16, dq, ds as *const u16, sgq,
-                            sgs,
-                            sdq,
-                            sds,
-                            f(&b.x),
-                            i(&b.idx),
-                            f(&b.wts),
-                            f(&b.sgate),
-                            f(&b.x),
-                            f(&b.act),
-                            f(&b.x),
-                            d as i32,
-                            mi as i32,
-                            topk as i32,
-                            post.f32(),
-                            eps,
-                            pf,
-                            pfb,
-                            s,
-                        )
+                            ffi::dr_moe_decode(
+                                gq, gs as *const u16, dq, ds as *const u16, sgq, sgs, sdq, sds, f(&b.x), idx, wts, f(&b.sgate), f(&b.x), f(&b.act), f(&b.x),
+                                d as i32, mi as i32, topk as i32, post.f32(), eps, pf, pfb, s,
+                            )
                         }
                     },
                     "moe_decode",
                 )
+            };
+            let Some(c) = cache else {
+                ops.push(Op::plain(move |pf, pfb| moe(moe_idx, f(&b.wts), pf, pfb)));
+                continue;
+            };
+            let mapped = layer_mapped(layer);
+            let src: Vec<*const u8> = (0..4).map(|q| part(layer, q).0).collect();
+            let key0 = (li * e) as i32;
+            let cpu = self.cpu_calls.get(li).map(|c| &**c as *const CpuCall as *mut c_void);
+            let io = self.io.as_ref().map(|p| p.ptr());
+            let cpu_out = self.cpu_out.as_ref();
+            ops.push(Op::plain(move |pf, pfb| {
+                launched(
+                    unsafe {
+                        ffi::dr_expert_slots(
+                            i(&b.idx), topk as i32, key0, c.slots as i32, i(&c.map), i(&c.owner), c.refb.ptr::<u32>(), c.tag.ptr::<u32>(),
+                            c.state.ptr::<u32>(), i(&c.sidx), i(&c.fill), MAX_REF, (!mapped) as i32, s,
+                        )
+                    },
+                    "expert_slots",
+                )?;
+                if !mapped {
+                    launched(
+                        unsafe {
+                            ffi::dr_expert_fill(
+                                i(&b.idx), i(&c.fill), topk as i32, src[0] as *const c_void, src[1] as *const c_void, src[2] as *const c_void,
+                                src[3] as *const c_void, c.banks[0].ptr(), c.banks[1].ptr(), c.banks[2].ptr(), c.banks[3].ptr(), c.bytes[0], c.bytes[1],
+                                c.bytes[2], c.bytes[3], s,
+                            )
+                        },
+                        "expert_fill",
+                    )?;
+                    return moe(moe_idx, f(&b.wts), pf, pfb);
+                }
+                // the GPU cannot read this layer's experts: it computes the cached ones, the CPU the rest
+                let io = io.expect("cpu io");
+                let out = cpu_out.expect("cpu out");
+                launched(
+                    unsafe { ffi::dr_moe_mask_misses(i(&c.fill), i(&c.sidx), f(&b.wts), c.slots as i32, topk as i32, i(&c.sidx2), f(&c.wts2), s) },
+                    "mask_misses",
+                )?;
+                unsafe {
+                    check(ffi::dr_d2h(std::ptr::addr_of_mut!((*io).x) as *mut c_void, b.x.ptr::<c_void>(), d * F32, s), "d2h")?;
+                    check(ffi::dr_d2h(std::ptr::addr_of_mut!((*io).idx) as *mut c_void, b.idx.ptr::<c_void>(), topk * I32, s), "d2h")?;
+                    check(ffi::dr_d2h(std::ptr::addr_of_mut!((*io).wts) as *mut c_void, b.wts.ptr::<c_void>(), topk * F32, s), "d2h")?;
+                    check(ffi::dr_d2h(std::ptr::addr_of_mut!((*io).fill) as *mut c_void, c.fill.ptr::<c_void>(), topk * I32, s), "d2h")?;
+                    check(ffi::dr_host_func(s, cpu_submit, cpu.expect("cpu call")), "host func")?;
+                }
+                moe(i(&c.sidx2), f(&c.wts2), pf, pfb)?;
+                check(unsafe { ffi::dr_host_func(s, cpu_wait, cpu.expect("cpu call")) }, "host func")?;
+                check(unsafe { ffi::dr_h2d(out.ptr(), std::ptr::addr_of!((*io).out) as *const c_void, d * F32, s) }, "h2d")?;
+                check(unsafe { ffi::dr_add_vec(f(&b.x), f(out), d as i32, s) }, "add")
             }));
         }
     }
@@ -1068,14 +1478,17 @@ impl Engine {
 
     /// Generate frames until end-of-speech or `max_new` frames.
     pub fn generate(
-        &mut self, prompt: &[i32], params: SampleParams, max_new: usize, mut on_frame: impl FnMut(&[i32]),
+        &mut self, prompt: &[i32], voice_rows: usize, params: SampleParams, max_new: usize, mut on_frame: impl FnMut(&[i32]),
     ) -> Result<Vec<Vec<i32>>> {
         let width = self.model.cfg.frame_width();
         let rows = prompt.len() / width;
-        self.prefill(prompt, params)?;
+        self.prefill(prompt, params, voice_rows)?;
         let room = self.max_len - rows;
         let mut out = Vec::new();
         for _ in 0..max_new.min(room) {
+            if self.stop.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(Cancelled.into());
+            }
             let (frame, _) = self.step()?;
             if frame[0] == self.model.cfg.eos_token_id {
                 break;

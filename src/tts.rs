@@ -18,6 +18,13 @@ use crate::engine::{Engine, SampleParams};
 use crate::model::{ExpertMode, Model};
 use crate::prompt::{self, Reference};
 
+/// VRAM left to other programs when the engine sizes itself to the free VRAM: a sixteenth of it, 256 MiB to 1 GiB.
+pub fn auto_margin(free: usize) -> usize {
+    (free / 16).clamp(256 << 20, 1 << 30)
+}
+/// VRAM the codec allocates while it encodes references and decodes speech.
+const CODEC_WORK: usize = 768 << 20;
+
 pub struct Tts {
     pub engine: Engine,
     pub codec: Codec,
@@ -26,12 +33,16 @@ pub struct Tts {
 
 pub struct SpeakOpts {
     pub params: SampleParams,
+    /// Most frames per sentence with `split`, for the whole text without it.
     pub max_new: usize,
     /// Frames in the first streamed chunk (small = low latency) and in later ones.
     pub first_chunk: usize,
     pub chunk: usize,
     /// Generate sentence by sentence (see `Tts::speak`).
     pub split: bool,
+    /// A sentence that ran into its cap and is said again keeps its stalled audio in the output (it was already
+    /// streamed). False: a sentence reaches the decoder only once it ended, so the output has no stalled audio.
+    pub keep_stalled: bool,
 }
 
 pub struct Spoken {
@@ -86,14 +97,57 @@ impl Tts {
         Self::load_with(model_dir, max_len, chunk, &ExpertMode::Q4)
     }
 
-    /// [`Tts::load`] with the routed experts from `experts` (int4 on the GPU, or the original FP8 in host RAM).
+    #[cfg(not(feature = "mlx"))]
+    /// The int4 experts on the GPU when the whole model fits `vram_limit` bytes (0: the free VRAM), else in RAM with a
+    /// VRAM expert cache ([`ExpertMode::Q4Ram`]).
+    pub fn fitting(model_dir: &Path, vram_limit: usize) -> Result<ExpertMode> {
+        let fit_limit = if vram_limit == 0 { crate::gpu::mem_info()?.0 } else { vram_limit };
+        let (enc_bytes, dec_bytes) = Codec::sizes(&model_dir.join("codec.safetensors"))?;
+        let whole = enc_bytes + dec_bytes + crate::model::full_vram(model_dir)? <= fit_limit as u64;
+        Ok(if whole { ExpertMode::Q4 } else { ExpertMode::Q4Ram { vram_limit } })
+    }
+
+    /// [`Tts::load`] with the routed experts from `experts` (int4 on the GPU or in host RAM, or the original FP8 in host
+    /// RAM).
     pub fn load_with(model_dir: &Path, max_len: usize, chunk: usize, experts: &ExpertMode) -> Result<Self> {
-        let codec = Codec::load(&model_dir.join("codec.safetensors"))?;
-        let st = crate::gpu::Stream::new()?;
-        let model = Model::load_with(model_dir, &st, experts)?;
-        let engine = Engine::new(model, max_len, chunk)?;
+        let (engine, codec) = match experts {
+            #[cfg(not(feature = "mlx"))]
+            ExpertMode::Q4Ram { vram_limit } => Self::load_offloaded(model_dir, max_len, chunk, *vram_limit, experts)?,
+            _ => {
+                let codec = Codec::load(&model_dir.join("codec.safetensors"))?;
+                let st = crate::gpu::Stream::new()?;
+                let model = Model::load_with(model_dir, &st, experts)?;
+                (Engine::new(model, max_len, chunk)?, codec)
+            }
+        };
         let tok = Tokenizer::from_file(model_dir.join("tokenizer.json")).map_err(|e| anyhow!("tokenizer: {e}"))?;
         Ok(Self { engine, codec, tok })
+    }
+
+    #[cfg(not(feature = "mlx"))]
+    /// The experts in RAM: the codec's encoder stays in RAM too, and what `vram_limit` leaves after the weights and the
+    /// codec's working memory goes to the expert cache.
+    fn load_offloaded(model_dir: &Path, max_len: usize, chunk: usize, vram_limit: usize, experts: &ExpertMode) -> Result<(Engine, Codec)> {
+        let (free0, _) = crate::gpu::mem_info()?;
+        let limit = if vram_limit == 0 { free0.saturating_sub(auto_margin(free0)) } else { vram_limit };
+        let codec = Codec::load_with(&model_dir.join("codec.safetensors"), true)?;
+        let st = crate::gpu::Stream::new()?;
+        let (free1, _) = crate::gpu::mem_info()?;
+        let codec_vram = free0.saturating_sub(free1);
+        let model = Model::load_with(model_dir, &st, experts)?;
+        let (free2, _) = crate::gpu::mem_info()?;
+        let used = free0.saturating_sub(free2);
+        let keep_free = free2.saturating_sub(limit.saturating_sub(used)) + CODEC_WORK;
+        let engine = Engine::with_cache(model, max_len, chunk, keep_free)?;
+        let (free3, _) = crate::gpu::mem_info()?;
+        let gib = |b: usize| b as f64 / (1u64 << 30) as f64;
+        eprintln!(
+            "VRAM: codec {:.2} GiB, weights {:.2} GiB, engine (buffers and expert cache) {:.2} GiB",
+            gib(codec_vram),
+            gib(used.saturating_sub(codec_vram)),
+            gib(free2.saturating_sub(free3))
+        );
+        Ok((engine, codec))
     }
 
     /// Encode a reference clip (any rate, mixed to mono) for voice cloning.
@@ -174,7 +228,7 @@ impl Tts {
                 let mut voices: Vec<Reference> = refs.to_vec();
                 let mut voiced: Vec<u32> = covered;
                 for (i, seg) in segments.iter().enumerate() {
-                    let rows = prompt::build_prompt_rows(seg, &voices, tok, ncb, cb)?;
+                    let (rows, voice_rows) = prompt::build_prompt(seg, &voices, tok, ncb, cb)?;
                     prompt_rows += rows.len() / width;
                     if i == 0 {
                         first_prompt = rows.clone();
@@ -187,16 +241,28 @@ impl Tts {
                     for attempt in 0..=STALL_RETRIES {
                         let mut params = opts.params;
                         params.seed = params.seed.wrapping_add(i as u64).wrapping_add(attempt as u64 * 1000);
-                        seg_frames = engine.generate(&rows, params, opts.max_new.min(cap), |frame| {
-                            let _ = tx.send(frame[1..].to_vec());
+                        seg_frames = engine.generate(&rows, voice_rows, params, opts.max_new.min(cap), |frame| {
+                            if opts.keep_stalled {
+                                let _ = tx.send(frame[1..].to_vec());
+                            }
                         })?;
                         stalled = seg_frames.len() >= cap;
-                        if !stalled {
+                        if !stalled || (!opts.keep_stalled && attempt == STALL_RETRIES) {
+                            if !opts.keep_stalled {
+                                let _ = tx.send(seg_frames.iter().flat_map(|f| f[1..].iter().copied()).collect());
+                            }
+                            if stalled {
+                                eprintln!("sentence {} ran into its {cap}-frame cap on every attempt", i + 1);
+                            }
                             break;
                         }
-                        // Its audio was played, so it stays in the output.
-                        frames.extend(seg_frames.drain(..));
                         eprintln!("sentence {} ran into its {cap}-frame cap without ending (attempt {})", i + 1, attempt + 1);
+                        if opts.keep_stalled {
+                            // Its audio was played, so it stays in the output.
+                            frames.extend(seg_frames.drain(..));
+                        } else {
+                            seg_frames.clear();
+                        }
                     }
                     if let Some(sp) = prompt::sole_speaker(seg) {
                         if opts.split && !stalled && !seg_frames.is_empty() && !voiced.contains(&sp) {
