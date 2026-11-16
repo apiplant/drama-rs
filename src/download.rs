@@ -88,6 +88,41 @@ pub fn find_original() -> Option<PathBuf> {
     local.chain(cache_dir().map(|c| c.join(ORIGINAL_DIR))).find(|p| is_original_dir(p))
 }
 
+/// Cache-directory name of the dense weights generated from the original checkpoint (no int4 experts).
+const DENSE_DIR: &str = "drama-3-dense";
+
+/// True for a directory made by [`generate_dense`]: it has no int4 experts.
+pub fn is_dense_only(p: &Path) -> bool {
+    std::fs::read_to_string(p.join("drama.json")).is_ok_and(|s| s.contains("\"dense_only\": true"))
+}
+
+fn complete(p: &Path) -> bool {
+    is_model_dir(p) && p.join("tokenizer.json").is_file() && (0..LAYERS).all(|i| p.join(format!("layer{i:02}.safetensors")).is_file())
+}
+
+/// Makes a model directory from the original checkpoint alone (dense weights, codec, tokenizer; the FP8 experts stay in
+/// the original), so no int4 build has to be downloaded. Pure Rust ([`crate::convert`]), a few minutes once, ~4 GB.
+pub fn generate_dense(orig: &Path) -> Result<PathBuf> {
+    let dir = cache_dir().context("no cache directory available (set $HOME or $XDG_CACHE_HOME)")?.join(DENSE_DIR);
+    if complete(&dir) {
+        return Ok(dir);
+    }
+    eprintln!("Generating dense weights and codec from {} into {} (one time)", orig.display(), dir.display());
+    let work = dir.with_extension("part");
+    crate::convert::dense(orig, &work)?;
+    let codec = work.join("codec.safetensors");
+    if !codec.is_file() {
+        eprintln!("converting the codec");
+        crate::convert::codec(&orig.join("codec.pth"), &codec)?;
+    }
+    anyhow::ensure!(complete(&work), "generation did not produce a complete model in {}", work.display());
+    if dir.exists() {
+        std::fs::remove_dir_all(&dir)?;
+    }
+    std::fs::rename(&work, &dir)?;
+    Ok(dir)
+}
+
 /// [`find_model`], else download into the cache directory (about 21 GB).
 pub fn default_model() -> Result<PathBuf> {
     match find_model() {
@@ -224,11 +259,17 @@ pub fn resolve(model: Option<&Path>, original: Option<&Path>, choice: Choice) ->
     #[cfg(feature = "mlx")]
     let choice = if choice.want == Want::Auto { Choice { want: Want::Q4, ..choice } } else { choice };
     let model_is_original = model.is_some_and(is_original_dir);
-    let q4 = match model {
-        Some(p) if !model_is_original => p.to_path_buf(),
-        _ => default_model()?,
-    };
+    let explicit = model.filter(|_| !model_is_original).map(Path::to_path_buf);
     let orig = original.map(Path::to_path_buf).or_else(|| model.filter(|_| model_is_original).map(Path::to_path_buf)).or_else(find_original);
+    let q4 = if let Some(p) = explicit {
+        p
+    } else {
+        match (&orig, find_model()) {
+            (_, Some(d)) => d,
+            (Some(o), None) if choice.want != Want::Q4 => generate_dense(o)?,
+            _ => download()?,
+        }
+    };
     let sizes = crate::model::sizes(&q4)?;
     resolve_with(q4, orig, choice, sizes, Hardware::detect())
 }
@@ -241,6 +282,9 @@ fn gb(b: u64) -> f64 {
 pub fn resolve_with(dir: PathBuf, original: Option<PathBuf>, choice: Choice, sizes: Sizes, hw: Hardware) -> Result<Resolved> {
     let Choice { want, vram_layers, reserve_bytes } = choice;
     let q4 = |why: &str| {
+        if is_dense_only(&dir) {
+            bail!("{} has no int4 experts (generated from the original checkpoint): use FP8 experts", dir.display());
+        }
         let summary = format!("int4 experts on the GPU{why}");
         Ok(Resolved { dir: dir.clone(), experts: ExpertMode::Q4, summary })
     };

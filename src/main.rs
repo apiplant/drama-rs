@@ -42,9 +42,11 @@ impl From<Experts> for drama::download::Want {
 
 #[derive(clap::Args)]
 struct Common {
-    /// The int4 build (tools/convert.py output; dense weights, codec, tokenizer), or the original fishaudio/drama-3
-    /// checkpoint (then the int4 build is found separately). Default: `models/drama-3-q4` or `drama-q4` here, in the
-    /// parent or next to the binary, then ~/.cache/drama-rs/drama-3-q4, else downloaded there (~21 GB)
+    /// The Drama 3 model directory: the original fishaudio/drama-3 checkpoint (FP8 experts, best quality) or the
+    /// converted int4 build (tools/convert.py output; faster, smaller). Default: the original if downloaded
+    /// (`models/drama-3` here, in the parent or next to the binary, then ~/.cache/drama-rs/drama-3), else the int4
+    /// build (`drama-3-q4`, downloaded to ~/.cache/drama-rs/ if missing, ~21 GB). The original works standalone: its dense
+    /// weights, codec and tokenizer are converted once into ~/.cache/drama-rs/drama-3-dense (~4 GB, about a minute)
     #[arg(long, env = "DRAMA_MODEL")]
     model: Option<PathBuf>,
     /// Routed experts. `auto` (default): original FP8 when the checkpoint is found and fits, else int4. `fp8`: original

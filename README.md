@@ -179,8 +179,11 @@ hf download fishaudio/drama-3 --local-dir models/drama-3   # 42 GB
 
 # needs a CUDA PyTorch; ~1 min per layer is plenty
 python tools/convert.py models/drama-3 models/drama-3-q4
-python tools/convert_codec.py models/drama-3/codec.pth models/drama-3-q4/codec.safetensors
-cp models/drama-3/tokenizer.json models/drama-3-q4/
+
+# the codec and tokenizer: `drama` converts them (in Rust) the first time it runs with models/drama-3 and no int4
+# build, into ~/.cache/drama-rs/drama-3-dense
+drama speak --text hi --out /dev/null
+cp ~/.cache/drama-rs/drama-3-dense/{codec.safetensors,tokenizer.json} models/drama-3-q4/
 ```
 
 ## Usage

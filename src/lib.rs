@@ -16,6 +16,7 @@
 //! ```
 
 mod config;
+pub mod convert;
 mod audio_io;
 #[cfg(not(feature = "mlx"))]
 pub mod codec;
