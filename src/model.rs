@@ -8,7 +8,7 @@ use memmap2::Mmap;
 use safetensors::{Dtype, SafeTensors};
 use serde::Deserialize;
 
-use crate::gpu::{DevBuf, Pinned, Stream};
+use crate::gpu::{DevBuf, HostBuf, Pinned, Stream};
 
 pub use crate::config::*;
 use crate::config::Meta;
@@ -28,17 +28,66 @@ impl Q8 {
     }
 }
 
+/// Where the converted int4 routed experts (about 80% of the weights) live.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Placement {
+    /// On the GPU with the rest of the model.
+    Vram,
+    /// In page-locked RAM; decoding keeps the experts in use in a VRAM cache (`Engine`).
+    Ram,
+}
+
+pub enum Bank {
+    Dev(DevBuf),
+    Host(HostBuf),
+    /// Left in the memory-mapped weights file (pageable): past the page-locking cap. Only the CPU reads it.
+    Mapped(std::sync::Arc<Mmap>, *const u8),
+}
+
+unsafe impl Send for Bank {}
+
+impl Bank {
+    /// The address kernels read.
+    pub fn dev(&self) -> *const u8 {
+        match self {
+            Bank::Dev(b) => b.ptr::<u8>(),
+            Bank::Host(b) => b.dev::<u8>(),
+            Bank::Mapped(..) => std::ptr::null(),
+        }
+    }
+
+    /// The address a host-to-device copy reads (RAM banks only).
+    pub fn host(&self) -> Option<*const u8> {
+        match self {
+            Bank::Dev(_) => None,
+            Bank::Host(b) => Some(b.host::<u8>()),
+            Bank::Mapped(_, p) => Some(*p),
+        }
+    }
+
+    /// The GPU cannot read it (pageable memory).
+    pub fn mapped(&self) -> bool {
+        matches!(self, Bank::Mapped(..))
+    }
+}
+
 /// Routed experts, int4 asymmetric with group 64: q [E, N, K/2], sm [E, N, K/64, 2].
 pub struct Q4 {
-    pub q: DevBuf,
-    pub sm: DevBuf,
+    pub q: Bank,
+    pub sm: Bank,
     pub n: usize,
     pub k: usize,
 }
 
 impl Q4 {
+    /// Bytes of one expert in q and in sm.
+    pub fn expert_bytes(&self) -> (usize, usize) {
+        (self.n * self.k / 2, self.n * (self.k / 64) * 4)
+    }
+
     pub fn expert(&self, e: usize) -> (*const u8, *const u16) {
-        (self.q.at::<u8>(e * self.n * self.k / 2), self.sm.at::<u16>(e * self.n * (self.k / 64) * 2))
+        let (bq, bs) = self.expert_bytes();
+        unsafe { (self.q.dev().add(e * bq), self.sm.dev().add(e * bs) as *const u16) }
     }
 }
 
@@ -120,6 +169,20 @@ pub struct Layer {
     pub experts: Experts,
 }
 
+impl Layer {
+    /// The int4 experts (gate_up, down): every layer has them unless the model runs the original FP8.
+    pub fn q4(&self) -> Option<(&Q4, &Q4)> {
+        match &self.experts {
+            Experts::Q4 { gate_up, down } => Some((gate_up, down)),
+            Experts::Fp8(_) => None,
+        }
+    }
+
+    pub fn q4_in_ram(&self) -> (&Q4, &Q4) {
+        self.q4().expect("experts in RAM are the int4 ones")
+    }
+}
+
 pub struct TowerLayer {
     pub tok_emb: Dense,
     pub enorm: Dense,
@@ -149,10 +212,12 @@ pub struct Model {
     pub tower_inv_freq: Dense,
     /// The full token embedding stays on the host; prefill gathers its rows.
     pub embed_tokens: HostTensor,
+    /// Where the int4 experts are: in RAM the engine keeps the ones in use in a VRAM cache.
+    pub placement: Placement,
 }
 
 pub struct HostTensor {
-    _map: Mmap,
+    _map: std::sync::Arc<Mmap>,
     ptr: *const u8,
     pub shape: Vec<usize>,
 }
@@ -169,13 +234,13 @@ impl HostTensor {
 }
 
 struct File {
-    map: Mmap,
+    map: std::sync::Arc<Mmap>,
 }
 
 impl File {
     fn open(path: &Path) -> Result<Self> {
         let f = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
-        let map = unsafe { Mmap::map(&f)? };
+        let map = std::sync::Arc::new(unsafe { Mmap::map(&f)? });
         Ok(Self { map })
     }
     fn st(&self) -> Result<SafeTensors<'_>> {
@@ -188,6 +253,12 @@ struct Loader<'a> {
     stream: &'a Stream,
     prefix: String,
     uploaded: &'a mut usize,
+    placement: Placement,
+    in_ram: &'a mut usize,
+    map: Option<std::sync::Arc<Mmap>>,
+    /// Bytes of experts that may still be page-locked; past it they stay in the mapped file.
+    pin_left: &'a mut usize,
+    in_file: &'a mut usize,
 }
 
 impl Loader<'_> {
@@ -220,16 +291,99 @@ impl Loader<'_> {
         Ok(Q8 { q, s, n: shape[0], k: shape[1] })
     }
 
+    fn bank(&mut self, name: &str, dtype: Dtype) -> Result<(Bank, Vec<usize>)> {
+        if self.placement == Placement::Vram {
+            let (buf, shape) = self.raw(name, dtype)?;
+            return Ok((Bank::Dev(buf), shape));
+        }
+        let t = self.st.tensor(name).map_err(|e| anyhow!("{}{name}: {e}", self.prefix))?;
+        if t.dtype() != dtype {
+            bail!("{}{name}: dtype {:?}, expected {dtype:?}", self.prefix, t.dtype());
+        }
+        let len = t.data().len();
+        if len <= *self.pin_left {
+            // the driver may refuse before our cap (Windows limits page-locked memory per process): the rest stays mapped
+            if let Ok(buf) = HostBuf::from_bytes(t.data()) {
+                *self.pin_left -= len;
+                *self.in_ram += len;
+                return Ok((Bank::Host(buf), t.shape().to_vec()));
+            }
+            *self.pin_left = 0;
+        }
+        let map = self.map.clone().ok_or_else(|| anyhow!("{}{name}: no file mapping for unpinned experts", self.prefix))?;
+        *self.in_file += len;
+        Ok((Bank::Mapped(map, t.data().as_ptr()), t.shape().to_vec()))
+    }
+
     fn q4(&mut self, name: &str) -> Result<Q4> {
-        let (q, shape) = self.raw(&format!("{name}.q4"), Dtype::U8)?;
-        let (sm, _) = self.raw(&format!("{name}.sm"), Dtype::F16)?;
+        let (q, shape) = self.bank(&format!("{name}.q4"), Dtype::U8)?;
+        let (sm, _) = self.bank(&format!("{name}.sm"), Dtype::F16)?;
         Ok(Q4 { q, sm, n: shape[1], k: shape[2] * 2 })
     }
+}
+
+/// Page-locked memory the experts may take: `DRAMA_PIN_CAP_GB`, else 45% of physical RAM on Windows (WDDM refuses
+/// page-locking past about half of it per process) and 75% elsewhere.
+fn pin_cap() -> usize {
+    if let Some(gb) = std::env::var("DRAMA_PIN_CAP_GB").ok().and_then(|v| v.parse::<f64>().ok()) {
+        return (gb * (1u64 << 30) as f64) as usize;
+    }
+    let ram = physical_ram();
+    if cfg!(windows) { ram / 100 * 45 } else { ram / 4 * 3 }
+}
+
+#[cfg(windows)]
+fn physical_ram() -> usize {
+    #[repr(C)]
+    struct MemoryStatusEx {
+        length: u32,
+        load: u32,
+        total_phys: u64,
+        avail_phys: u64,
+        total_page: u64,
+        avail_page: u64,
+        total_virtual: u64,
+        avail_virtual: u64,
+        avail_ext: u64,
+    }
+    extern "system" {
+        fn GlobalMemoryStatusEx(buf: *mut MemoryStatusEx) -> i32;
+    }
+    let mut m = MemoryStatusEx { length: std::mem::size_of::<MemoryStatusEx>() as u32, load: 0, total_phys: 0, avail_phys: 0, total_page: 0, avail_page: 0, total_virtual: 0, avail_virtual: 0, avail_ext: 0 };
+    if unsafe { GlobalMemoryStatusEx(&mut m) } == 0 {
+        return usize::MAX;
+    }
+    m.total_phys as usize
+}
+
+#[cfg(not(windows))]
+fn physical_ram() -> usize {
+    std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|s| s.lines().find(|l| l.starts_with("MemTotal:")).and_then(|l| l.split_whitespace().nth(1)?.parse::<usize>().ok()))
+        .map_or(usize::MAX, |kb| kb * 1024)
 }
 
 fn inv_freq(theta: f64, rot: usize) -> Vec<f32> {
     // Same arithmetic as torch: 1 / theta ** (arange(0, rot, 2) / rot) in f32.
     (0..rot / 2).map(|i| 1.0f32 / (theta as f32).powf((2 * i) as f32 / rot as f32)).collect()
+}
+
+/// VRAM the engine needs besides the weights and the codec with `Placement::Vram`: KV caches, decode and prefill buffers,
+/// cuBLAS and the codec's working memory (measured 1.46 GiB at a 2048-row context: peak 21.83 GiB of the process).
+const RUNTIME_RESERVE: u64 = 1792 << 20;
+
+/// VRAM the whole model takes on the GPU with `Placement::Vram`, codec weights excluded.
+pub fn full_vram(dir: &Path) -> Result<u64> {
+    let mut weights = 0u64;
+    for entry in std::fs::read_dir(dir).with_context(|| format!("read {}", dir.display()))? {
+        let p = entry?.path();
+        let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if name.starts_with("layer") || name == "tower.safetensors" {
+            weights += std::fs::metadata(&p)?.len();
+        }
+    }
+    Ok(weights + RUNTIME_RESERVE)
 }
 
 impl Model {
@@ -239,6 +393,8 @@ impl Model {
 
     /// [`Model::load`] with the routed experts taken from `experts`.
     pub fn load_with(dir: &Path, stream: &Stream, experts: &ExpertMode) -> Result<Self> {
+        let progress = std::io::IsTerminal::is_terminal(&std::io::stderr());
+        let placement = if matches!(experts, ExpertMode::Q4Ram { .. }) { Placement::Ram } else { Placement::Vram };
         let meta: Meta = serde_json::from_slice(&std::fs::read(dir.join("drama.json")).context("read drama.json")?)?;
         if meta.format != "drama-rs-v1" || meta.q4_group != 64 || meta.q8_group != 128 {
             bail!("unsupported converted format in {}", dir.display());
@@ -248,15 +404,28 @@ impl Model {
         let dc = &cfg.audio_decoder_config;
         let t0 = std::time::Instant::now();
         let mut uploaded = 0usize;
+        let mut in_ram = 0usize;
+        let mut in_file = 0usize;
+        let mut pin_left = pin_cap();
 
         let fp8 = match experts {
             ExpertMode::Fp8 { dir, .. } => Some(Fp8Source::open(dir)?),
-            ExpertMode::Q4 => None,
+            ExpertMode::Q4 | ExpertMode::Q4Ram { .. } => None,
         };
         let mut layers = Vec::with_capacity(tc.num_hidden_layers);
         for i in 0..tc.num_hidden_layers {
             let file = File::open(&dir.join(format!("layer{i:02}.safetensors")))?;
-            let mut l = Loader { st: file.st()?, stream, prefix: format!("layer{i:02}."), uploaded: &mut uploaded };
+            let mut l = Loader {
+                st: file.st()?,
+                stream,
+                prefix: format!("layer{i:02}."),
+                uploaded: &mut uploaded,
+                placement,
+                in_ram: &mut in_ram,
+                map: Some(file.map.clone()),
+                pin_left: &mut pin_left,
+                in_file: &mut in_file,
+            };
             let mixer = if cfg.is_linear(i) {
                 Mixer::Linear(LinearAttn {
                     in_proj: l.q8("la.in_proj")?,
@@ -290,12 +459,16 @@ impl Model {
                 },
             });
             stream.sync()?;
-            eprint!("\rloading weights: layer {}/{}", i + 1, tc.num_hidden_layers);
+            if progress {
+                eprint!("\rloading weights: layer {}/{}", i + 1, tc.num_hidden_layers);
+            }
         }
-        eprintln!();
+        if progress {
+            eprintln!();
+        }
 
         let file = File::open(&dir.join("tower.safetensors"))?;
-        let mut l = Loader { st: file.st()?, stream, prefix: "tower.".into(), uploaded: &mut uploaded };
+        let mut l = Loader { st: file.st()?, stream, prefix: "tower.".into(), uploaded: &mut uploaded, placement: Placement::Vram, in_ram: &mut in_ram, map: None, pin_left: &mut pin_left, in_file: &mut in_file };
         let mut tower = Vec::new();
         for t in 0..cfg.tower_layers() {
             let p = format!("t{t}.");
@@ -322,7 +495,7 @@ impl Model {
 
         let gfile = File::open(&dir.join("globals.safetensors"))?;
         let gst = gfile.st()?;
-        let mut l = Loader { st: gfile.st()?, stream, prefix: "globals.".into(), uploaded: &mut uploaded };
+        let mut l = Loader { st: gfile.st()?, stream, prefix: "globals.".into(), uploaded: &mut uploaded, placement: Placement::Vram, in_ram: &mut in_ram, map: None, pin_left: &mut pin_left, in_file: &mut in_file };
         let lm_head_cand = l.bf16("lm_head_cand")?;
         let final_norm = l.f32("final_norm")?;
         stream.sync()?;
@@ -353,11 +526,19 @@ impl Model {
         let tower_inv_freq = Dense { buf: DevBuf::from_slice(&inv_freq(dc.rope_base, trot), stream)?, shape: vec![trot / 2] };
         stream.sync()?;
 
-        eprintln!(
-            "loaded {:.2} GB of weights in {:.1}s",
-            (uploaded + cand.len()) as f64 / 1e9,
-            t0.elapsed().as_secs_f64()
-        );
+        if in_ram + in_file > 0 {
+            eprintln!(
+                "loaded {:.2} GB of weights to the GPU and {:.2} GB of experts to page-locked RAM in {:.1}s",
+                (uploaded + cand.len()) as f64 / 1e9,
+                in_ram as f64 / 1e9,
+                t0.elapsed().as_secs_f64()
+            );
+            if in_file > 0 {
+                eprintln!("{:.2} GB of experts past the page-locking cap stay in the mapped files; the CPU computes them", in_file as f64 / 1e9);
+            }
+        } else {
+            eprintln!("loaded {:.2} GB of weights in {:.1}s", (uploaded + cand.len()) as f64 / 1e9, t0.elapsed().as_secs_f64());
+        }
         Ok(Self {
             cfg,
             layers,
@@ -370,6 +551,7 @@ impl Model {
             text_inv_freq,
             tower_inv_freq,
             embed_tokens,
+            placement,
         })
     }
 }
